@@ -1,0 +1,21 @@
+[submodule "e3sm-io/e3sm-io"]
+	path = e3sm-io/e3sm-io
+	url = https://github.com/Parallel-NetCDF/E3SM-IO.git
+[submodule "openfoam/openfoam"]
+	path = openfoam/openfoam
+	url = https://github.com/OpenFOAM/OpenFOAM-12.git
+[submodule "wrf/wrf"]
+	path = wrf/wrf
+	url = https://github.com/wrf-model/WRF.git
+[submodule "montage-pegasus/montage"]
+	path = montage-pegasus/montage
+	url = https://github.com/Caltech-IPAC/Montage.git
+[submodule "montage-pegasus/montage-workflow-v3"]
+	path = montage-pegasus/montage-workflow-v3
+	url = https://github.com/pegasus-isi/montage-workflow-v3.git
+[submodule "montage-pegasus/pegasus"]
+	path = montage-pegasus/pegasus
+	url = https://github.com/pegasus-isi/pegasus.git
+[submodule "lammps/lammps"]
+	path = lammps/lammps
+	url = https://github.com/lammps/lammps.git

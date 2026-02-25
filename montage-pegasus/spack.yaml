@@ -1,0 +1,27 @@
+# Montage Pegasus workload - Spack environment
+#
+# Uses Spack for: Python, AstroPy, Ant, OpenJDK
+# Externals from packages.yaml are used when available (concretize -f will show them).
+# Montage is built from submodule; Condor/Pegasus from tarballs in install.sh.
+#
+# See docs/pegasus_montage.rst in llnl/dftracer for the full tutorial.
+spack:
+  specs:
+  - python@3.12
+  # py-astropy: install via pip (requirements.txt) - Spack build fails with wcslib API mismatch
+  - ant
+  - openjdk  # for pegasus-mpi-cluster build
+  view: true
+  concretizer:
+    reuse: false
+    unify: true
+  packages:
+    gcc:
+      externals:
+      - spec: gcc@13.3.0 languages:='c,c++,fortran'
+        prefix: /usr
+        extra_attributes:
+          compilers:
+            c: /usr/bin/gcc
+            cxx: /usr/bin/g++
+            fortran: /usr/bin/gfortran

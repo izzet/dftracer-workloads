@@ -1,0 +1,29 @@
+--- a/main/ideal_em.F
++++ b/main/ideal_em.F
+@@ -264,7 +264,7 @@ SUBROUTINE med_initialdata_output ( grid , config_flags )
+    INTEGER                :: fid , ierr , id
+    CHARACTER (LEN=80)      :: rstname
+    CHARACTER (LEN=80)      :: message
+-   CHARACTER (LEN=80)      :: inpname , bdyname
++   CHARACTER (LEN=256)     :: inpname , bdyname
+ 
+    !  Initialize the mother domain.
+ 
+@@ -272,7 +272,7 @@ SUBROUTINE med_initialdata_output ( grid , config_flags )
+    CALL init_domain (  grid )
+    CALL calc_current_date ( grid%id, 0.)
+ 
+-   CALL construct_filename1 ( inpname , 'wrfinput' , grid%id , 2 )
++   CALL construct_filename2a ( inpname , config_flags%input_outname , grid%id , 2 , " " )
+    CALL open_w_dataset ( id, TRIM(inpname) , grid , config_flags , output_input , "DATASET=INPUT", ierr )
+    IF ( ierr .NE. 0 ) THEN
+      WRITE (wrf_err_message,*)'ideal: error opening wrfinput for writing ',ierr
+@@ -284,7 +284,7 @@ SUBROUTINE med_initialdata_output ( grid , config_flags )
+ 
+    IF ( config_flags%specified ) THEN
+  
+-     CALL construct_filename1 ( bdyname , 'wrfbdy' , grid%id , 2 )
++     CALL construct_filename2a ( bdyname , config_flags%bdy_outname , grid%id , 2 , " " )
+      CALL open_w_dataset ( id, TRIM(bdyname) , grid , config_flags , output_boundary , "DATASET=BOUNDARY", ierr )
+      IF ( ierr .NE. 0 ) THEN
+        WRITE (wrf_err_message,*)'ideal: error opening wrfbdy for writing ',ierr

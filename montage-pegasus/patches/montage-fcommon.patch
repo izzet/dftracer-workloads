@@ -1,0 +1,8 @@
+--- a/lib/src/coord/Makefile
++++ b/lib/src/coord/Makefile
+@@ -1,6 +1,6 @@
+ CC      =	gcc
+-CFLAGS  =	-g -c -fPIC -D_LARGEFILE_SOURCE \
++CFLAGS  =	-g -c -fPIC -fcommon -D_LARGEFILE_SOURCE \
+ 		-D_FILE_OFFSET_BITS=64 -I. -I../../include
+ LIBNAME =	libcoord.a

@@ -1,0 +1,26 @@
+spack:
+  specs:
+  - autoconf
+  - automake
+  - libtool
+  - m4
+  - openmpi
+  - parallel-netcdf@1.14.0
+  - hdf5@1.14.6+mpi
+  - netcdf-c@4.9.2+mpi
+  - adios2@2.8.3+mpi
+  - python@3.12
+  view: true
+  concretizer:
+    reuse: false
+    unify: true
+  packages:
+    gcc:
+      externals:
+      - spec: gcc@13.3.0 languages:='c,c++,fortran'
+        prefix: /usr
+        extra_attributes:
+          compilers:
+            c: /usr/bin/gcc
+            cxx: /usr/bin/g++
+            fortran: /usr/bin/gfortran

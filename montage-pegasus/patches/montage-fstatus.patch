@@ -1,0 +1,18 @@
+--- a/Montage/montage.h
++++ b/Montage/montage.h
+@@ -1,4 +1,4 @@
+ #ifndef MONTAGE
+-FILE *fstatus;
++extern FILE *fstatus;
+ #define MONTAGE
+ #endif
+--- a/Montage/debugCheck.c
++++ b/Montage/debugCheck.c
+@@ -14,6 +14,8 @@
+ #include "montage.h"
+ 
++FILE *fstatus;  /* definition for montage.h extern */
++
+ /**********************************************************/
+ /*                                                        */
+ /*  debugCheck                                            */

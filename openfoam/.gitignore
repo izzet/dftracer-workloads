@@ -1,0 +1,27 @@
+.venv/
+.spack-env/
+logs/*
+!logs/.gitkeep
+output*/
+tmp/
+.DS_Store
+*.swp
+*.swo
+
+# OpenFOAM case artifacts (decomposed run directories)
+processor*/
+processors*/
+
+# OpenFOAM in-source build artifacts produced by spack develop / Allwmake.
+# Spack renames openfoam/ -> OpenFOAM-12/ and leaves openfoam as a symlink,
+# so we cover both names here.
+openfoam/platforms/
+openfoam/build/
+openfoam/dynamicCode/
+openfoam/.OpenFOAM-*/
+openfoam/ThirdParty-*/
+OpenFOAM-12/platforms/
+OpenFOAM-12/build/
+OpenFOAM-12/dynamicCode/
+OpenFOAM-12/.OpenFOAM-*/
+OpenFOAM-12/ThirdParty-*/

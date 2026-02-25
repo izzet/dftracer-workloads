@@ -1,0 +1,31 @@
+spack:
+  specs:
+    # WRF built with MPI-parallel (dmpar), idealized baroclinic-wave compile type,
+    # and parallel NetCDF support.
+    - wrf@4.6.1 build_type=dmpar compile_type=em_b_wave pnetcdf=true
+    - python@3.12
+
+  # spack develop: Spack builds WRF from the local submodule source at ./wrf
+  # instead of downloading a tarball.  This lets us edit WRF source (e.g., add
+  # runtime knob-change hooks) while Spack still manages all dependencies and
+  # drives the configure/compile with the correct env vars.
+  # After source edits: run ./build.sh for an incremental rebuild.
+  develop:
+    wrf:
+      spec: wrf@4.6.1 build_type=dmpar compile_type=em_b_wave pnetcdf=true
+      path: ./wrf
+
+  view: true
+  concretizer:
+    reuse: false
+    unify: true
+  packages:
+    gcc:
+      externals:
+      - spec: gcc@13.3.0 languages:='c,c++,fortran'
+        prefix: /usr
+        extra_attributes:
+          compilers:
+            c: /usr/bin/gcc
+            cxx: /usr/bin/g++
+            fortran: /usr/bin/gfortran

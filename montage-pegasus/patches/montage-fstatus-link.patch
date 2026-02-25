@@ -1,0 +1,43 @@
+--- a/b/Montage/Makefile.LINUX	2026-02-17 22:23:33.832707010 -0600
++++ b/Montage/Makefile.LINUX	2026-02-17 22:23:27.793134138 -0600
+@@ -152,7 +152,7 @@
+ 		$(CC) -o mFitplane mFitplane.o debugCheck.o $(LIBS)
+ 
+ mFlattenExec:	mFlattenExec.o filePath.o
+-		$(CC) -o mFlattenExec mFlattenExec.o filePath.o $(LIBS)
++		$(CC) -o mFlattenExec mFlattenExec.o filePath.o debugCheck.o $(LIBS)
+ 
+ mGetHdr:	mGetHdr.o checkFile.o checkHdr.o checkWCS.o
+ 		$(CC) -o mGetHdr checkFile.o mGetHdr.o checkHdr.o checkWCS.o \
+@@ -160,11 +160,11 @@
+ 
+ mHdrCheck:	mHdrCheck.o checkHdr.o checkWCS.o checkFile.o
+ 		$(CC) -o mHdrCheck mHdrCheck.o checkHdr.o checkWCS.o \
+-		checkFile.o $(LIBS)
++		checkFile.o debugCheck.o $(LIBS)
+ 
+ mHdrtbl:	mHdrtbl.o get_hfiles.o get_hhdr.o print_hrec.o checkWCS.o
+ 		$(CC) -g -o mHdrtbl mHdrtbl.o get_hfiles.o \
+-		get_hhdr.o print_hrec.o checkWCS.o $(LIBS)
++		get_hhdr.o print_hrec.o checkWCS.o debugCheck.o $(LIBS)
+ 
+ mImgtbl:	mImgtbl.o get_files.o get_hdr.o print_rec.o checkWCS.o
+ 		$(CC) -g -o mImgtbl mImgtbl.o get_files.o \
+@@ -231,7 +231,7 @@
+ 		checkHdr.o checkWCS.o $(LIBS)
+ 
+ mTblSort:	mTblSort.o 
+-		$(CC) -o mTblSort mTblSort.o $(LIBS)
++		$(CC) -o mTblSort mTblSort.o debugCheck.o $(LIBS)
+ 
+ mTileHdr:	mTileHdr.o debugCheck.o checkHdr.o checkWCS.o
+ 		$(CC) -o mTileHdr mTileHdr.o debugCheck.o \
+@@ -239,7 +239,7 @@
+ 
+ mTileImage:	mTileImage.o checkHdr.o checkWCS.o subImage.o
+ 		$(CC) -o mTileImage mTileImage.o \
+-		checkHdr.o checkWCS.o subImage.o $(LIBS)
++		checkHdr.o checkWCS.o subImage.o debugCheck.o $(LIBS)
+ 
+ install:
+ 		cp $(BINS) ../bin

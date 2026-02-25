@@ -1,0 +1,16 @@
+.venv/
+.spack-env/
+logs/*
+!logs/.gitkeep
+install/
+downloads/
+condor/
+pegasus-binary/
+output*/
+work/
+data/
+*.dag
+*.sub
+.DS_Store
+*.swp
+*.swo
