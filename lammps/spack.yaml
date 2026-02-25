@@ -1,0 +1,29 @@
+spack:
+  specs:
+    # ~kspace avoids FFTW dependency; LJ melt does not need long-range electrostatics
+    - lammps+mpi~kspace
+    - python@3.12
+
+  # spack develop: Spack builds LAMMPS from the local submodule source at ./lammps
+  # instead of downloading a tarball.  This lets us edit LAMMPS source (e.g., add
+  # runtime knob-change hooks) while Spack still manages all dependencies.
+  # After source edits: run ./build.sh for an incremental rebuild.
+  develop:
+    lammps:
+      spec: lammps+mpi~kspace
+      path: ./lammps
+
+  view: true
+  concretizer:
+    reuse: false
+    unify: true
+  packages:
+    gcc:
+      externals:
+      - spec: gcc@13.3.0 languages:='c,c++,fortran'
+        prefix: /usr
+        extra_attributes:
+          compilers:
+            c: /usr/bin/gcc
+            cxx: /usr/bin/g++
+            fortran: /usr/bin/gfortran

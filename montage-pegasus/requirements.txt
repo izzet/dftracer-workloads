@@ -1,0 +1,6 @@
+dftracer
+dftracer-analyzer>=0.0.7
+pyyaml
+astropy
+pegasus-wms
+six

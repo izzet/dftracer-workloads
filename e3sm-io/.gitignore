@@ -1,0 +1,14 @@
+.venv/
+.spack-env/
+logs/*
+!logs/.gitkeep
+build/
+install/
+output*/
+tmp/
+tmp/dfanalyzer_*/
+.DS_Store
+*.swp
+*.swo
+
+# Workload-specific generated data

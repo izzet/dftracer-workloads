@@ -1,0 +1,32 @@
+spack:
+  specs:
+  - openfoam-org@12
+  - python@3.12
+
+  # spack develop: Spack builds openfoam-org from the git submodule at
+  # openfoam/openfoam/ (relative to this spack.yaml) instead of from a
+  # downloaded tarball.  This gives full source access for code patches,
+  # custom knob-registration hooks, and incremental rebuilds.
+  #
+  # After ./install.sh sets up the submodule, run:
+  #   spack -e . install --only package openfoam-org
+  # to incrementally rebuild OpenFOAM after source changes.
+  develop:
+    openfoam-org:
+      spec: openfoam-org@12
+      path: openfoam    # relative to this spack.yaml: resolves to openfoam/openfoam/
+
+  view: true
+  concretizer:
+    reuse: false
+    unify: true
+  packages:
+    gcc:
+      externals:
+      - spec: gcc@13.3.0 languages:='c,c++,fortran'
+        prefix: /usr
+        extra_attributes:
+          compilers:
+            c: /usr/bin/gcc
+            cxx: /usr/bin/g++
+            fortran: /usr/bin/gfortran

@@ -1,0 +1,24 @@
+.venv/
+.spack-env/
+logs/*
+!logs/.gitkeep
+build/
+install/
+output*/
+tmp/
+tmp/dfanalyzer_*/
+
+# Per-run working directories (case copies)
+run/runs/
+
+# Build info (machine-specific paths)
+logs/build_info.env
+
+.DS_Store
+*.swp
+*.swo
+
+# Workload-specific generated data
+run/
+WPS/
+wrf/wrf/test/em_real/
