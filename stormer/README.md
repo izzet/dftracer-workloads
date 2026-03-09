@@ -11,6 +11,9 @@ DFTracer instrumentation is already integrated in the real training code. When
 `DFTRACER_ENABLE=1`, the app emits per-rank trace files from the training path
 itself. This standalone repo does not include Mofka, analyzer, diagnoser, or
 optimizer services.
+For standalone runs, `run.sh` also auto-enables the local DFTracer preload
+library when available, so intercepted POSIX calls are captured without any
+extra `LD_PRELOAD` setup.
 
 The standalone default is intentionally simple:
 - local `.venv`
@@ -60,8 +63,14 @@ DATA_FOLDER=/p/lustre5/izzet/datasets/era5/hdf5 ./run_tuo.sh
 DATA_FOLDER=/p/lustre5/izzet/datasets/era5/hdf5 DFTRACER_ENABLE=1 ./run_tuo.sh
 ```
 
-`install_tuo.sh` loads `cray-python/3.11.7`, `gcc/13.3.1`, and `rocm/6.3.1`
-so `dftracer` can build from source on Tuolumne's `glibc 2.28` hosts.
+`install_tuo.sh` loads `cray-python/3.11.7`, `gcc/13.3.1`, and `rocm/6.3.1`,
+then installs the known-good traced stack:
+- `torch 2.9.1+rocm6.3`
+- `torchvision 0.24.1+rocm6.3`
+- `dftracer 1.0.15`
+
+This is the current working Tuolumne combination for Stormer with DFTracer
+preload and POSIX capture enabled.
 `run_tuo.sh` defaults to a one-rank Flux launch shape on Tuolumne.
 
 ## What `install.sh` does

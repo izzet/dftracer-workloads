@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="${ROOT_DIR}/.venv"
+VENV_DIR="${VENV_DIR:-${ROOT_DIR}/.venv}"
 
 ensure_module_command() {
   if type module >/dev/null 2>&1; then

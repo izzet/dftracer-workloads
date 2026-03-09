@@ -1,4 +1,4 @@
-.venv/
+.venv*/
 logs/*
 !logs/.gitkeep
 output*/

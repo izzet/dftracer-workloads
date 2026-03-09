@@ -13,6 +13,8 @@ NODES="${NODES:-1}"
 TASKS="${TASKS:-}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-1}"
 GPUS_PER_TASK="${GPUS_PER_TASK:-1}"
+FLUX_QUEUE="${FLUX_QUEUE:-}"
+FLUX_TIME_LIMIT="${FLUX_TIME_LIMIT:-}"
 DATA_FOLDER="${DATA_FOLDER:-}"
 
 NUM_WORKERS="${NUM_WORKERS:-10}"
@@ -38,6 +40,8 @@ Options:
   --tasks N                  Total tasks/ranks (default: nodes * gpus-per-node)
   --gpus-per-node N          GPUs per node visible to the job (default: 1)
   --gpus-per-task N          GPUs per task for flux runs (default: 1)
+  --flux-queue NAME          Flux queue for launcher=flux
+  --flux-time-limit VALUE    Flux time limit, e.g. 15m
   --data-folder PATH         HDF5 dataset root with normalization files
   --output-root PATH         Root directory for workload outputs
   --epochs N                 Training epochs (default: 2)
@@ -64,6 +68,8 @@ while [[ $# -gt 0 ]]; do
     --tasks) TASKS="$2"; shift 2 ;;
     --gpus-per-node) GPUS_PER_NODE="$2"; shift 2 ;;
     --gpus-per-task) GPUS_PER_TASK="$2"; shift 2 ;;
+    --flux-queue) FLUX_QUEUE="$2"; shift 2 ;;
+    --flux-time-limit) FLUX_TIME_LIMIT="$2"; shift 2 ;;
     --data-folder) DATA_FOLDER="$2"; shift 2 ;;
     --output-root) OUTPUT_ROOT="$2"; shift 2 ;;
     --epochs) EPOCHS="$2"; shift 2 ;;
@@ -112,7 +118,49 @@ if [[ "${DFTRACER_ENABLE}" == "1" ]]; then
   export DFTRACER_INC_METADATA
   export DFTRACER_LOG_FILE="${DFTRACER_LOG_FILE:-${RUN_LOG_DIR}/trace}"
   export DFTRACER_DATA_DIR="${DFTRACER_DATA_DIR:-${DATA_FOLDER}:${RUN_OUT_DIR}}"
+  if [[ -z "${DFTRACER_PRELOAD_LIB:-}" && "${DFTRACER_INIT}" == "PRELOAD" ]]; then
+    DFTRACER_PRELOAD_LIB="$(
+      python - <<'PY'
+import contextlib
+import os
+
+with contextlib.suppress(Exception):
+    import dftracer
+
+    root = os.path.dirname(dftracer.__file__)
+    candidates = [
+        os.path.join(root, "lib64", "libdftracer_preload.so"),
+        os.path.join(root, "lib", "libdftracer_preload.so"),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            print(candidate)
+            raise SystemExit(0)
+PY
+    )"
+    export DFTRACER_PRELOAD_LIB
+  fi
   if [[ -n "${DFTRACER_PRELOAD_LIB:-}" ]]; then
+    DFTRACER_PRELOAD_DIR="$(dirname "${DFTRACER_PRELOAD_LIB}")"
+    DFTRACER_TORCH_LIB_DIR="$(
+      python - <<'PY'
+import contextlib
+import os
+
+with contextlib.suppress(Exception):
+    import torch
+
+    torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+    if os.path.isdir(torch_lib):
+        print(torch_lib)
+        raise SystemExit(0)
+PY
+    )"
+    if [[ -n "${DFTRACER_TORCH_LIB_DIR}" ]]; then
+      export LD_LIBRARY_PATH="${DFTRACER_PRELOAD_DIR}:${DFTRACER_TORCH_LIB_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    else
+      export LD_LIBRARY_PATH="${DFTRACER_PRELOAD_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    fi
     export LD_PRELOAD="${DFTRACER_PRELOAD_LIB}${LD_PRELOAD:+:${LD_PRELOAD}}"
   fi
 fi
@@ -175,6 +223,8 @@ fi
   echo "TASKS=${TASKS}"
   echo "GPUS_PER_NODE=${GPUS_PER_NODE}"
   echo "GPUS_PER_TASK=${GPUS_PER_TASK}"
+  echo "FLUX_QUEUE=${FLUX_QUEUE}"
+  echo "FLUX_TIME_LIMIT=${FLUX_TIME_LIMIT}"
   echo "DATA_FOLDER=${DATA_FOLDER}"
   echo "RUN_LOG_DIR=${RUN_LOG_DIR}"
   echo "RUN_OUT_DIR=${RUN_OUT_DIR}"
@@ -190,7 +240,15 @@ case "${LAUNCHER}" in
       echo "flux launcher requested but 'flux' is not available." >&2
       exit 1
     fi
-    flux run -N "${NODES}" -n "${TASKS}" -g "${GPUS_PER_TASK}" --exclusive \
+    FLUX_RUN_CMD=(flux run)
+    if [[ -n "${FLUX_QUEUE}" ]]; then
+      FLUX_RUN_CMD+=(-q "${FLUX_QUEUE}")
+    fi
+    if [[ -n "${FLUX_TIME_LIMIT}" ]]; then
+      FLUX_RUN_CMD+=(-t "${FLUX_TIME_LIMIT}")
+    fi
+    FLUX_RUN_CMD+=(-N "${NODES}" -n "${TASKS}" -g "${GPUS_PER_TASK}" --exclusive)
+    "${FLUX_RUN_CMD[@]}" \
       "${TRAIN_CMD[@]}" 2>&1 | tee "${LOG_FILE}"
     ;;
   mpiexec)

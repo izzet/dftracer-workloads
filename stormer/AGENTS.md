@@ -68,6 +68,8 @@ DATA_FOLDER=/p/lustre5/izzet/datasets/era5/hdf5 ./run_tuo.sh
   `gcc/13.3.1`
 - Import failure in `build.sh`: inspect `logs/build.log`
 - No DFTracer traces: ensure `DFTRACER_ENABLE=1` and `dftracer` is installed
+- Missing POSIX events with `DFTRACER_ENABLE=1`: verify the runner exported the
+  local DFTracer preload library in `logs/runs/<run_id>/env.txt`
 
 ## Commit Hygiene
 
