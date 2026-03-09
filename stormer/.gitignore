@@ -1,0 +1,16 @@
+.venv/
+logs/*
+!logs/.gitkeep
+output*/
+tmp/
+
+.DS_Store
+*.swp
+*.swo
+*.pyc
+__pycache__/
+
+# Generated datasets and model artifacts
+*.h5
+*.nc
+*.npz

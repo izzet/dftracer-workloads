@@ -1,0 +1,8 @@
+dftracer
+h5py
+numpy
+strenum
+timm
+torch
+torchvision
+tqdm

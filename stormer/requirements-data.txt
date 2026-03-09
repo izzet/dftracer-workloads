@@ -1,0 +1,6 @@
+dask[complete]
+gcsfs
+h5netcdf
+jax
+netcdf4
+xarray[io]
