@@ -1,9 +1,17 @@
 try:
-    from dftracer.python.logger import (
-        dftracer as PerfTracer,
-        dft_fn as Profile,
-        DFTRACER_ENABLE as PERFTRACER_ENABLE,
-    )
+    import os as _os
+    if _os.environ.get("DFTRACER_LOG_LEVEL", "").upper() == "DEBUG":
+        from dftracer.python.dbg import (
+            dftracer as PerfTracer,
+            dft_fn as Profile,
+            DFTRACER_ENABLE as PERFTRACER_ENABLE,
+        )
+    else:
+        from dftracer.python.logger import (
+            dftracer as PerfTracer,
+            dft_fn as Profile,
+            DFTRACER_ENABLE as PERFTRACER_ENABLE,
+        )
     from dftracer.python.ai_common import AI
 
     dft_ai = AI(enable=PERFTRACER_ENABLE)

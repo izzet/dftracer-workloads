@@ -58,6 +58,10 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.transforms import transforms
 from torch.nn.parallel import DistributedDataParallel as DDP
+try:
+    from torch.nn.parallel.distributed import _MixedPrecision
+except ImportError:
+    _MixedPrecision = None
 from torch.utils.data import Dataset
 import torch.distributed as dist
 
@@ -85,6 +89,19 @@ log = logging.getLogger(__name__)
 GPUS = os.environ.get("ROCR_VISIBLE_DEVICES", "")
 DEVICE_TYPE = "cuda" if torch.cuda.is_available() else "cpu"
 DEVICE_ID = 0 # since we only see 1 gpu, so GPU that is observed by the process will be 0
+
+
+def get_ddp_reduce_dtype(value: str | None):
+    if value is None:
+        return None
+    value = value.strip().lower()
+    if value in ("", "none", "off", "0"):
+        return None
+    if value in ("16", "fp16", "float16"):
+        return torch.float16
+    if value in ("bf16", "bfloat16"):
+        return torch.bfloat16
+    raise ValueError(f"Unsupported STORMER_DDP_REDUCE_DTYPE={value}")
 
 VARIABLES = [
     "2m_temperature",
@@ -186,6 +203,7 @@ class ERA5Dataset(Dataset):
         self.year_list = year_list
         self.year_idx_map: dict | None = None
         self.image_shape = self.args.in_img_size
+        self.downsample = os.environ.get("STORMER_DOWNSAMPLE", "1") == "1"
         if year_list is not None:
             self.year_idx_map = {year: i for i, year in enumerate(year_list)}
 
@@ -239,12 +257,20 @@ class ERA5Dataset(Dataset):
         f = h5py.File(path, "r")
         x = []
         for var in variables:
-            d = f["input"][var][:].reshape(1, *self.image_shape)
-            x.append(d)
+            d = f["input"][var][:]
+            x.append(d.reshape(1, *d.shape[-2:]))
         f.close()
         del f
 
-        return torch.from_numpy(np.concatenate(x))
+        out = torch.from_numpy(np.concatenate(x))  # (V, H_file, W_file)
+        if self.downsample and out.shape[-2:] != tuple(self.image_shape):
+            out = torch.nn.functional.interpolate(
+                out.unsqueeze(0),  # (1, V, H_file, W_file)
+                size=self.image_shape,
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)  # (V, H_target, W_target)
+        return out
     
     def __len__(self):
         return len(self.inp_file_paths)
@@ -339,13 +365,44 @@ class DataModule:
     def get_transforms(self):
         return self.transforms, self.out_transforms
 
+    def val_dataloader(self, max_samples=50):
+        """Create a small validation DataLoader from the val/ split."""
+        val_dir = os.path.join(self.root_dir, "val")
+        if not os.path.isdir(val_dir):
+            return None
+        dataset = ERA5Dataset(
+            args=self.args,
+            root_dir=val_dir,
+            variables=self.variables,
+            inp_transform=self.transforms,
+            out_transform_dict=self.out_transforms,
+            list_intervals=self.intervals,
+            data_freq=self.data_freq,
+        )
+        if len(dataset) > max_samples:
+            indices = list(range(0, len(dataset), len(dataset) // max_samples))[:max_samples]
+            dataset = torch.utils.data.Subset(dataset, indices)
+        batch_size = self.batch_size
+        collate_fn = collate_fn_train
+        if self.args.disable_collation and batch_size == 1:
+            batch_size = None
+            collate_fn = None
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+            collate_fn=collate_fn,
+        )
+
     def dataloader(self, loader_config: dict[str, Any] | None = None):
         if loader_config is None:
             loader_config = {
                 "num_workers": self.args.num_workers,
                 "pin_memory": self.args.pin_memory,
                 "persistent_workers": self.args.persistent_workers,
-                "prefetch_factor": self.args.prefetch_factor,
+                "prefetch_factor": self.args.prefetch_factor if self.args.num_workers > 0 else None,
             }
 
         dataset = ERA5Dataset(
@@ -478,14 +535,30 @@ class Trainer:
         # self.net.to(MPI_LOCAL_RANK)
         self.net.to(device=self.device)
 
+        self._ddp_mixed_precision = None
         if MPIUtils.size() > 1:
+            _bucket_cap = float(os.environ.get("STORMER_BUCKET_CAP_MB", "25"))
+            reduce_dtype = get_ddp_reduce_dtype(os.environ.get("STORMER_DDP_REDUCE_DTYPE"))
+            if reduce_dtype is not None:
+                if _MixedPrecision is None:
+                    raise RuntimeError("DDP mixed precision is unavailable in this torch build")
+                self._ddp_mixed_precision = _MixedPrecision(reduce_dtype=reduce_dtype)
             if MPIUtils.rank() == 0:
-                log.info("Setting up DDP")
+                if self._ddp_mixed_precision is not None:
+                    log.info(
+                        "Setting up DDP (bucket_cap_mb=%.0f, reduce_dtype=%s)",
+                        _bucket_cap,
+                        str(reduce_dtype).replace("torch.", ""),
+                    )
+                else:
+                    log.info("Setting up DDP (bucket_cap_mb=%.0f)", _bucket_cap)
             self.net = DDP(
                 self.net,
                 device_ids=[DEVICE_ID],
                 # device_ids=[MPI_LOCAL_RANK],
                 output_device=DEVICE_ID,
+                bucket_cap_mb=_bucket_cap,
+                mixed_precision=self._ddp_mixed_precision,
             )
         elif MPIUtils.rank() == 0:
             log.info("Running without DDP (single-process mode)")
@@ -587,6 +660,9 @@ class Trainer:
         # Only step optimizer at end of accumulation window
         if batch_idx % n_accum_steps == 0:
             if self.scaler:
+                self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
+            if self.scaler:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
@@ -611,9 +687,69 @@ class Trainer:
 
         with sync_context:
             loss, loss_item = self.forward_step(batch)
+
+            # Skip NaN losses to prevent gradient divergence at scale
+            if torch.isnan(loss) or torch.isinf(loss):
+                self.optimizer.zero_grad(set_to_none=True)
+                return float("nan")
+
+            # Normalize loss for gradient accumulation (keeps effective LR constant)
+            if n_accum_steps > 1:
+                loss = loss / n_accum_steps
+
             self.backward_step(loss, batch_idx, n_accum_steps)
 
         return loss_item.cpu().item()
+
+    @torch.no_grad()
+    def validate_epoch(self, epoch):
+        """Run validation on held-out data (rank 0 only to avoid file contention)."""
+        if MPIUtils.rank() != 0:
+            if MPIUtils.size() > 1:
+                dist.barrier()
+            return
+        if not hasattr(self, "_val_loader"):
+            try:
+                self._val_loader = self.datamodule.val_dataloader(max_samples=30)
+                log.info(
+                    "Val loader created: %s (%d samples)",
+                    "OK" if self._val_loader else "None",
+                    len(self._val_loader.dataset) if self._val_loader else 0,
+                )
+            except Exception as exc:
+                log.info("WARNING: val_dataloader failed: %s", exc)
+                self._val_loader = None
+        if self._val_loader is None:
+            if MPIUtils.size() > 1:
+                dist.barrier()
+            return
+
+        model = self.net.module if isinstance(self.net, DDP) else self.net
+        model.eval()
+        val_losses = []
+        try:
+            for batch in self._val_loader:
+                batch = self.send_to_device(batch)
+                x, gt_diff, interval = batch
+                with self.autocast_context_manager():
+                    pred_diff = self.forward_train(x, self.variables, interval)
+                    loss_dict = lat_weighted_mse(
+                        pred_diff,
+                        gt_diff,
+                        self.variables,
+                        self.lat,
+                        weighted=self.weighted_loss,
+                        weight_dict=WEIGHT_DICT,
+                    )
+                val_losses.append(loss_dict["w_mse_aggregate"].item())
+        except Exception as exc:
+            log.info("WARNING: validation step failed: %s", exc)
+        model.train()
+        avg_val_loss = sum(val_losses) / len(val_losses) if val_losses else float("nan")
+        log.info("VAL_LOSS epoch=%d val_loss=%.4f (n=%d samples)", epoch, avg_val_loss, len(val_losses))
+        if MPIUtils.size() > 1:
+            dist.barrier()
+        return avg_val_loss
 
     @dft_ai.pipeline.train
     def train(self):
@@ -679,6 +815,7 @@ class Trainer:
                         dft_ai.update(epoch=epoch, step=step)
                         collate_profiler.update(epoch=epoch, step=step)
             finally:
+                self.validate_epoch(epoch)
                 if pbar:
                     pbar.close()
                 dft_ai.pipeline.epoch.stop(metadata=True)
@@ -730,7 +867,8 @@ def get_args():
     parser.add_argument("--max-training-step", type=int, default=-1, help="Maximum training steps (default: -1 for unlimited)")
     parser.add_argument("--weighted-loss", action="store_true", default=True, help="Use weighted loss (default: True)")
     parser.add_argument("--enable-progress-bar", action="store_true", default=True, help="Enable progress bar (default: True)")
-    parser.add_argument("--sync-batchnorm", action="store_true", default=True, help="Synchronize batch normalization (default: True)")
+    parser.add_argument("--sync-batchnorm", action="store_true", default=False, help="Synchronize batch normalization across ranks")
+    parser.add_argument("--no-sync-batchnorm", dest="sync_batchnorm", action="store_false")
     parser.add_argument("--accumulate-grad-batches", type=int, default=1, help="Accumulate gradient batches (default: 1)")
 
     args = parser.parse_args()
@@ -745,6 +883,8 @@ def main() -> None:
     os.makedirs(log_folder, exist_ok=True)
     configure_logging(output_dir=log_folder)
 
+    dftracer_logger = None
+
     if DEVICE_TYPE != "cuda":
         raise RuntimeError("Stormer training requires a CUDA/ROCm GPU environment.")
 
@@ -757,11 +897,12 @@ def main() -> None:
 
     dist_initialized = False
     if MPIUtils.size() > 1:
+        from datetime import timedelta
+        _nccl_timeout = int(os.environ.get("STORMER_NCCL_TIMEOUT", "1800"))
         dist.init_process_group(
-            backend="nccl", 
+            backend="nccl",
             init_method="env://",
-            # init_method=f"tcp://{hostname}:{port}",
-            # timeout=3600,
+            timeout=timedelta(seconds=_nccl_timeout),
             world_size=MPIUtils.size(),
             rank=MPIUtils.rank(),
             device_id=DEVICE_ID,
@@ -783,11 +924,21 @@ def main() -> None:
         for key, value in vars(args).items():
             log.info(f" {key}: {value}")
 
+    if MPIUtils.rank() == 0:
+        log.info(
+            "DFTracer init: DFTRACER_ENABLE=%s WRITER_TYPE=%s GROUP_FILE=%s data_dir=%s",
+            os.environ.get("DFTRACER_ENABLE"),
+            os.environ.get("DFTRACER_WRITER_TYPE"),
+            os.environ.get("DFTRACER_MOFKA_GROUP_FILE"),
+            args.data_folder,
+        )
+
     pfwlogger = PerfTracer.initialize_log(
         logfile=f"{log_folder}/trace-{MPIUtils.rank() + 1}-of-{MPIUtils.size()}.pfw",
         data_dir=args.data_folder,
         process_id=MPIUtils.rank(),
     )
+    dftracer_logger = pfwlogger
 
     with dft_ai:
         model = Stormer(
@@ -817,6 +968,8 @@ def main() -> None:
         trainer.finalize()
 
     pfwlogger.finalize()
+    if dftracer_logger is not None:
+        dftracer_logger.finalize()
     if dist_initialized:
         dist.barrier()
         dist.destroy_process_group()
