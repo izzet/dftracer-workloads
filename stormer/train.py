@@ -263,6 +263,18 @@ class ERA5Dataset(Dataset):
         f.close()
         del f
 
+        # STORMER_DROP_CACHE=1: evict this file from the OS page cache after reading so every
+        # read stays COLD and the input pole is steady (does not self-relieve via cache warming).
+        # This is what lets the optimizer's trend gate see a persistent bottleneck and ACTUATE
+        # (add workers) — the actuating regime for the closed-loop demo. No effect when unset.
+        if os.environ.get("STORMER_DROP_CACHE", "0") == "1":
+            try:
+                _fd = os.open(path, os.O_RDONLY)
+                os.posix_fadvise(_fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                os.close(_fd)
+            except OSError:
+                pass
+
         out = torch.from_numpy(np.concatenate(x))  # (V, H_file, W_file)
         if self.downsample and out.shape[-2:] != tuple(self.image_shape):
             out = torch.nn.functional.interpolate(
@@ -432,14 +444,21 @@ class DataModule:
 
         use_live = os.environ.get("DFOPTIMIZER_ENABLE", "0") == "1"
 
+        # With Ulysses sequence parallelism, all sp ranks in a block consume the SAME sample
+        # (sequence-split), so shard the sampler over data-parallel groups (world/sp) and give
+        # every rank in a block the same shard index. sp=1 -> unchanged (rank/size).
+        _sp = int(getattr(self.args, "ulysses_sp", 1) or 1)
+        _smp_replicas = max(1, MPIUtils.size() // _sp)
+        _smp_rank = MPIUtils.rank() // _sp
+
         if use_live:
             from live_sampler import LiveSampler
             from live_data_loader import LiveDataLoader
 
             sampler = LiveSampler(
                 dataset,
-                num_replicas=MPIUtils.size(),
-                rank=MPIUtils.rank(),
+                num_replicas=_smp_replicas,
+                rank=_smp_rank,
                 shuffle=True,
                 seed=self.args.seed,
             )
@@ -458,8 +477,8 @@ class DataModule:
         if MPIUtils.size() >= 1:
             sampler = DistributedSampler(
                 dataset=dataset,
-                rank=MPIUtils.rank(),
-                num_replicas=MPIUtils.size(),
+                rank=_smp_rank,
+                num_replicas=_smp_replicas,
                 seed=self.args.seed,
                 shuffle=True,
                 drop_last=False,
@@ -561,6 +580,32 @@ class Trainer:
         # self.net.to(MPI_LOCAL_RANK)
         self.net.to(device=self.device)
 
+        # --- switchable DeepSpeed-Ulysses sequence parallelism (non-invasive) ---
+        # Applied AFTER to(device) and BEFORE DDP wrap so DDP wraps the patched model and its
+        # all_reduce averages the per-chunk gradients over the full world (correct up to a
+        # constant 1/sp factor, params stay identical). stormer.py is never edited.
+        self._sp_size = int(getattr(self.args, "ulysses_sp", 1) or 1)
+        self._sp_group = None
+        if self._sp_size > 1:
+            if MPIUtils.size() % self._sp_size != 0:
+                raise ValueError(
+                    f"--ulysses-sp {self._sp_size} must divide world size {MPIUtils.size()}"
+                )
+            import ulysses_sp
+            ulysses_sp.maybe_init_deepspeed()
+            (
+                self._sp_group, self._dp_group, sp_size, sp_rank, dp_size, dp_rank,
+            ) = ulysses_sp.init_sp_dp_groups(self._sp_size)
+            ulysses_sp.apply_ulysses_sp(self.net, self._sp_group)
+            # global rank of sp-rank 0 in this contiguous sp block (broadcast source)
+            self._sp_src = (MPIUtils.rank() // self._sp_size) * self._sp_size
+            if MPIUtils.rank() == 0:
+                log.info(
+                    "ULYSSES_SP: enabled (sp_degree=%d -> %d dp groups); attention all_to_all "
+                    "on forward critical path, stormer.py unedited",
+                    self._sp_size, dp_size,
+                )
+
         self._ddp_mixed_precision = None
         if MPIUtils.size() > 1:
             _bucket_cap = float(os.environ.get("STORMER_BUCKET_CAP_MB", "25"))
@@ -611,10 +656,17 @@ class Trainer:
         _comm_hook_enabled = (
             self._comm_timing or self._comm_optimize or PERFTRACER_ENABLE
         )
+        # Clean comm probe: barrier BEFORE timing the all_reduce so the measured comm excludes
+        # input-induced straggler wait (ranks synchronized first) -> straggler-free comm
+        # attribution for the controller. Opt-in (STORMER_COMM_SYNC_PROBE=1); adds a barrier per
+        # bucket, so only for the clean-attribution/CLBO mode. Default off = unchanged.
+        _comm_sync_probe = os.environ.get("STORMER_COMM_SYNC_PROBE", "0") == "1"
         if _comm_hook_enabled and MPIUtils.size() > 1:
             def _comm_hook(state, bucket):
                 with dft_ai.comm.all_reduce:
                     torch.cuda.synchronize()
+                    if _comm_sync_probe:
+                        dist.barrier()
                     t0 = time.time()
                     work = dist.all_reduce(bucket.buffer(), async_op=True)
                     work.wait()
@@ -702,6 +754,14 @@ class Trainer:
         x = x.to(device=self.device)  # , non_blocking=True)
         gt_diff = gt_diff.to(device=self.device)  # , non_blocking=True)
         interval_tensors = interval_tensors.to(device=self.device)  # , non_blocking=True)
+        # Ulysses SP: all sp ranks in a block share one sample; the input read is deterministic
+        # per index (identical across the block) but the interval is randomly chosen per
+        # __getitem__, so sync it within the sp_group to keep the t-conditioning (and thus the
+        # gathered attention sequence) coherent. Tiny [B] broadcast; does not perturb the read
+        # or all_to_all timing. (Target gt_diff stays per-rank; it only affects the loss value,
+        # not the systems measurement.)
+        if getattr(self, "_sp_size", 1) > 1 and self._sp_group is not None:
+            dist.broadcast(interval_tensors, src=self._sp_src, group=self._sp_group)
         return x, gt_diff, interval_tensors
 
     def autocast_context_manager(self):
@@ -824,36 +884,84 @@ class Trainer:
         except Exception as e:
             log0("WARNING: optimizer context setup failed: %s", e)
 
-    def _poll_and_apply_plans(self, train_loader):
-        """Drain pending optimizer actions and reconfigure LiveDataLoader."""
-        ctx = self._optimizer_ctx
-        if ctx is None or ctx._noop:
+    def _sync_apply_window(self, train_loader):
+        """Apply optimizer plans SYMMETRICALLY across all ranks at a window boundary.
+
+        The optimizer context is active on only a SUBSET of ranks and plans arrive at slightly
+        different window boundaries. Two hard constraints shaped this design:
+          1. Consensus must NOT use an NCCL collective. Under Ulysses SP the process groups are
+             subgroups (sp_group all_to_all, dp_group all_reduce); injecting a WORLD NCCL collective
+             here interleaves with those subgroup collectives and deadlocks (observed: ALLTOALL vs
+             BROADCAST timeout). So consensus runs over MPI/mpi4py on the CPU instead - fully
+             independent of the NCCL comm stream.
+          2. Every applied knob must be collective-free. Input knobs (reconfigure) are per-rank.
+             The comm knob is accumulate_grad_batches (sync cadence), applied by assignment - NO
+             DDP rebuild (whose broadcast is what deadlocked with SP).
+        Each rank drains its own actions (or none), then we MPI-allreduce(MAX) the desired values
+        with a -1 sentinel for 'no plan seen': every rank converges on the same targets and applies
+        together; the sentinel (not the stale current) lets a knob move DOWN too. Gated on the
+        rank-symmetric DFOPTIMIZER_ENABLE so LiveIO/no-optimizer runs are byte-identical."""
+        if not getattr(self, "_optimizer_active", False):
             return
         from live_data_loader import LiveDataLoader
-        if not isinstance(train_loader, LiveDataLoader):
-            return
-        actions = ctx.drain_actions_for("stormer.make_loader", at="window_boundary")
-        if not actions:
-            return
-        new_w = None
-        new_pf = None
-        for action in actions:
-            knob_name = action.knob_id
-            if knob_name.startswith("stormer."):
-                knob_name = knob_name[len("stormer."):]
-            if knob_name == "num_workers":
-                new_w = int(action.new_value)
-                ctx.ack_action(action, train_loader.num_workers, new_w)
-            elif knob_name == "prefetch_factor":
-                new_pf = int(action.new_value)
-                ctx.ack_action(action, train_loader.prefetch_factor, new_pf)
-            else:
-                ctx.ack_action(action, None, None, status="rejected")
-        train_loader.reconfigure(num_workers=new_w, prefetch_factor=new_pf)
+        SENT = -1
+        want_w = want_pf = want_accum = SENT
+        ctx = self._optimizer_ctx
+        if ctx is not None and not ctx._noop and isinstance(train_loader, LiveDataLoader):
+            actions = ctx.drain_actions_for("stormer.make_loader", at="window_boundary") or []
+            for action in actions:
+                knob_name = action.knob_id
+                if knob_name.startswith("stormer."):
+                    knob_name = knob_name[len("stormer."):]
+                if knob_name == "num_workers":
+                    want_w = int(action.new_value)
+                    ctx.ack_action(action, train_loader.num_workers, want_w)
+                elif knob_name == "prefetch_factor":
+                    want_pf = int(action.new_value)
+                    ctx.ack_action(action, train_loader.prefetch_factor, want_pf)
+                elif knob_name == "accumulate_grad_batches":
+                    want_accum = int(action.new_value)
+                    ctx.ack_action(action, self.accumulate_grad_batches, want_accum)
+                else:
+                    ctx.ack_action(action, None, None, status="rejected")
+        # Consensus over MPI (CPU) - never NCCL, so it cannot interleave with SP subgroup
+        # collectives. Buffer-based Allreduce on a numpy array does an ELEMENT-WISE max (the
+        # pickle-based lowercase allreduce would compare the lists lexicographically instead).
+        if MPIUtils.size() > 1 and MPIUtils.is_mpi():
+            from mpi4py import MPI
+            _buf = np.array([want_w, want_pf, want_accum], dtype=np.int64)
+            _out = np.empty_like(_buf)
+            MPIUtils.comm_world().Allreduce(_buf, _out, op=MPI.MAX)
+            want_w, want_pf, want_accum = int(_out[0]), int(_out[1]), int(_out[2])
+        # INPUT knobs: apply the agreed values on every rank (symmetric -> no stragglers). Per-rank,
+        # non-collective.
+        new_w = want_w if want_w > SENT else None
+        new_pf = want_pf if want_pf > SENT else None
+        if (new_w is not None or new_pf is not None) and isinstance(train_loader, LiveDataLoader):
+            train_loader.reconfigure(num_workers=new_w, prefetch_factor=new_pf)
+        # COMM knob: change the gradient-sync cadence by assignment. No collective. Clear any stale
+        # partial-accumulation gradients so the next accumulation window starts clean (mirrors the
+        # self-contained heuristic in _comm_optimize_window).
+        if want_accum > SENT and want_accum != self.accumulate_grad_batches:
+            old_accum = self.accumulate_grad_batches
+            self.accumulate_grad_batches = want_accum
+            self.optimizer.zero_grad(set_to_none=True)
+            if MPIUtils.rank() == 0:
+                log.info("COMM_OPT: accumulate_grad_batches %d -> %d (sync cadence)",
+                         old_accum, want_accum)
 
     @torch.no_grad()
     def validate_epoch(self, epoch):
         """Run validation on held-out data (rank 0 only to avoid file contention)."""
+        # Ulysses SP: validation runs the model forward on rank 0 only while other ranks wait at
+        # a barrier, but the SP attention all_to_all is a collective over the whole sp_group, so
+        # a rank-0-only forward DEADLOCKS. Skip validation entirely in SP mode (all ranks check
+        # the same _sp_size and return together -> no collective mismatch). Not needed for the
+        # systems/timing study.
+        if getattr(self, "_sp_size", 1) > 1:
+            if MPIUtils.rank() == 0:
+                log.info("Skipping validation (Ulysses SP mode; rank-0-only val is incompatible with SP collectives)")
+            return
         if MPIUtils.rank() != 0:
             # Non-rank-0 processes wait at barrier
             if MPIUtils.size() > 1:
@@ -990,6 +1098,11 @@ class Trainer:
     @dft_ai.pipeline.train
     def train(self):
         self._setup_optimizer_context()
+        # Job-wide, rank-symmetric gate for the plan-apply collective. The optimizer context is
+        # active on only a SUBSET of ranks, but DFOPTIMIZER_ENABLE is identical on every rank, so
+        # gating the collective on it keeps all ranks in lockstep (and leaves LiveIO/no-optimizer
+        # runs byte-identical: no extra collective when it is off).
+        self._optimizer_active = os.environ.get("DFOPTIMIZER_ENABLE", "0") == "1"
 
         # Register knobs with optimizer (if context is active)
         if self._optimizer_ctx and not self._optimizer_ctx._noop:
@@ -997,8 +1110,15 @@ class Trainer:
                 from dfoptimizer.runtime import knob
                 from dfoptimizer.runtime.knob import knob_def_from_dict
                 _knob_max_workers = int(os.environ.get("STORMER_KNOB_MAX_WORKERS", "8"))
-                knob_defs = {
-                    "num_workers": knob(
+                # INPUT knobs (num_workers / prefetch_factor) actuate via a mid-run DataLoader
+                # worker respawn (_apply_reconfigure). Under Ulysses SP that respawn can hang a rank
+                # and break the SP all_to_all lockstep, so it is gated (STORMER_TUNE_INPUT, default
+                # on) to allow isolating the comm loop, which actuates collective-free.
+                _tune_input = os.environ.get("STORMER_TUNE_INPUT", "1") == "1"
+                knob_defs = {}
+                _current = {}
+                if _tune_input:
+                    knob_defs["num_workers"] = knob(
                         default=self.args.num_workers,
                         range=(0, _knob_max_workers),
                         type=int,
@@ -1011,8 +1131,8 @@ class Trainer:
                                 "apply_when": "window_boundary",
                             },
                         },
-                    ),
-                    "prefetch_factor": knob(
+                    )
+                    knob_defs["prefetch_factor"] = knob(
                         default=self.args.prefetch_factor,
                         range=(1, 16),
                         type=int,
@@ -1025,8 +1145,33 @@ class Trainer:
                                 "apply_when": "window_boundary",
                             },
                         },
-                    ),
-                }
+                    )
+                    _current["num_workers"] = self.args.num_workers
+                    _current["prefetch_factor"] = self.args.prefetch_factor
+                # COMM knob: accumulate_grad_batches is the LIVE comm-domain knob. Raising it makes
+                # DDP sync gradients less often (fewer all_reduces), so it tunes the comm domain
+                # WITHOUT any collective to apply (unlike bucket_cap, whose mid-run DDP rebuild
+                # broadcast interleaves with the Ulysses SP all_to_all and deadlocks). Opt-in
+                # (STORMER_TUNE_COMM=1), multi-rank only. Domain=comm is inferred by CLBOPlanner.
+                _tune_comm = os.environ.get("STORMER_TUNE_COMM", "0") == "1" and MPIUtils.size() > 1
+                self._tune_comm_live = _tune_comm
+                if _tune_comm:
+                    knob_defs["accumulate_grad_batches"] = knob(
+                        default=int(self.accumulate_grad_batches),
+                        range=(int(os.environ.get("STORMER_KNOB_ACCUM_MIN", "1")),
+                               int(os.environ.get("STORMER_KNOB_ACCUM_MAX", "8"))),
+                        type=int,
+                        responds_to={
+                            "comm_optimization": {
+                                "direction": "increase",
+                                "step_mode": "evidence",
+                                "min_persistence": 1,
+                                "cooldown_windows": 3,
+                                "apply_when": "window_boundary",
+                            },
+                        },
+                    )
+                    _current["accumulate_grad_batches"] = int(self.accumulate_grad_batches)
                 built_defs = {
                     k: knob_def_from_dict(f"stormer.{k}", v, target_function="stormer.make_loader")
                     for k, v in knob_defs.items()
@@ -1034,13 +1179,11 @@ class Trainer:
                 self._optimizer_ctx.register_knobs(
                     "stormer.make_loader",
                     built_defs,
-                    current_values={
-                        "num_workers": self.args.num_workers,
-                        "prefetch_factor": self.args.prefetch_factor,
-                    },
+                    current_values=_current,
                 )
-                log0("Registered knobs: num_workers=%s, prefetch_factor=%s",
-                     self.args.num_workers, self.args.prefetch_factor)
+                log0("Registered knobs: num_workers=%s, prefetch_factor=%s%s",
+                     self.args.num_workers, self.args.prefetch_factor,
+                     (", accumulate_grad_batches=%d" % int(self.accumulate_grad_batches)) if _tune_comm else "")
             except Exception as e:
                 log0("WARNING: knob registration failed: %s", e)
 
@@ -1054,7 +1197,9 @@ class Trainer:
         # cadence so the analyzer knows when to drain and analyze.
         _window = None
         _n_steps_eff = self.max_training_step if self.max_training_step > 0 else self.n_steps
-        _window_every_n = max(_n_steps_eff // 5, 1)
+        # cadence: STORMER_WINDOW_EVERY_N overrides (finer cadence -> more optimizer opportunities
+        # to actuate); default = 5 windows per run.
+        _window_every_n = int(os.environ.get("STORMER_WINDOW_EVERY_N", "0") or 0) or max(_n_steps_eff // 5, 1)
         try:
             from dfoptimizer.runtime import Window
             _window = Window(PerfTracer.get_instance(), max_every_n=self.n_steps)
@@ -1129,6 +1274,12 @@ class Trainer:
                             self._comm_bucket_ms.clear()
                             fwd_ms = self._fwd_ms
                             bwd_ms = self._bwd_ms
+                            # Ulysses SP all_to_all (inside forward) — the COMM pole. Opt-in
+                            # CUDA-event timer (STORMER_SP_TIME_A2A=1); 0 when SP off / timer off.
+                            a2a_ms = 0.0
+                            if getattr(self, "_sp_size", 1) > 1:
+                                import ulysses_sp
+                                a2a_ms = ulysses_sp.pop_a2a_ms()
                             other_ms = step_ms - fwd_ms - bwd_ms
                             total_ms = _fetch_ms + step_ms
                             _loss_for_ct = loss if isinstance(loss, float) else float("nan")
@@ -1137,11 +1288,14 @@ class Trainer:
                             _loss_val = loss if isinstance(loss, float) else float("nan")
                             self._comm_window_steps.append((step_ms, comm_ms, n_buckets, _loss_val))
                             if MPIUtils.rank() == 0 and self._comm_timing:
+                                # exposed comm = DDP all_reduce (bwd, usually hidden) + SP a2a (fwd, non-overlappable)
+                                _exposed_comm = comm_ms + a2a_ms
                                 log.info(
-                                    "COMM_TIMING e=%d s=%d total=%.0f fetch=%.0f step=%.0f fwd=%.0f bwd=%.0f comm=%.0f(%d buckets) other=%.0f comm_pct=%.1f%% fetch_pct=%.1f%%",
+                                    "COMM_TIMING e=%d s=%d total=%.0f fetch=%.0f step=%.0f fwd=%.0f bwd=%.0f comm=%.0f(%d buckets) a2a=%.0f other=%.0f comm_pct=%.1f%% a2a_pct=%.1f%% fetch_pct=%.1f%%",
                                     epoch, step, total_ms, _fetch_ms, step_ms, fwd_ms, bwd_ms, comm_ms, n_buckets,
-                                    other_ms,
+                                    a2a_ms, other_ms,
                                     100 * comm_ms / total_ms if total_ms > 0 else 0,
+                                    100 * a2a_ms / total_ms if total_ms > 0 else 0,
                                     100 * _fetch_ms / total_ms if total_ms > 0 else 0,
                                 )
                             _t_fetch0 = time.time()
@@ -1159,7 +1313,7 @@ class Trainer:
 
                         # Poll optimizer at window boundaries for mid-epoch reconfiguration
                         if step % _window_every_n == 0:
-                            self._poll_and_apply_plans(train_loader)
+                            self._sync_apply_window(train_loader)
                             self._comm_optimize_window()
             finally:
                 # Epoch-level comm timing summary
@@ -1235,6 +1389,13 @@ def get_args():
     parser.add_argument("--depth", type=int, default=24, help="Depth (default: 24)")
     parser.add_argument("--num-heads", type=int, default=16, help="Number of heads (default: 16)")
     parser.add_argument("--mlp-ratio", type=float, default=4.0, help="MLP ratio (default: 4.0)")
+    parser.add_argument(
+        "--ulysses-sp",
+        type=int,
+        default=int(os.environ.get("STORMER_ULYSSES_SP", "1")),
+        help="DeepSpeed-Ulysses sequence-parallel degree (1=off/stock; must divide world size). "
+        "Non-invasive: monkeypatches attention + Stormer.forward at runtime, stormer.py unedited.",
+    )
     # trainer
     parser.add_argument("--precision", type=str, default="16", help="Precision (str, int, or None). Default: 16")
     parser.add_argument("--epochs", type=int, default=1, help="Number of epochs (default: 1)")
