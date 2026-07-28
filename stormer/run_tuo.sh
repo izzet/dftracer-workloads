@@ -7,7 +7,7 @@ export LAUNCHER="${LAUNCHER:-flux}"
 export NODES="${NODES:-1}"
 export GPUS_PER_NODE="${GPUS_PER_NODE:-1}"
 export GPUS_PER_TASK="${GPUS_PER_TASK:-1}"
-export FLUX_QUEUE="${FLUX_QUEUE:-pdebug}"
+export FLUX_QUEUE="${FLUX_QUEUE:-pbatch}"
 export FLUX_TIME_LIMIT="${FLUX_TIME_LIMIT:-15m}"
 export PRECISION="${PRECISION:-32}"
 
