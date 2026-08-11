@@ -905,7 +905,7 @@ class Trainer:
             return
         from live_data_loader import LiveDataLoader
         SENT = -1
-        want_w = want_pf = want_accum = SENT
+        want_w = want_pf = want_accum = want_bcap = SENT
         ctx = self._optimizer_ctx
         if ctx is not None and not ctx._noop and isinstance(train_loader, LiveDataLoader):
             actions = ctx.drain_actions_for("stormer.make_loader", at="window_boundary") or []
@@ -922,6 +922,9 @@ class Trainer:
                 elif knob_name == "accumulate_grad_batches":
                     want_accum = int(action.new_value)
                     ctx.ack_action(action, self.accumulate_grad_batches, want_accum)
+                elif knob_name == "bucket_cap_mb" and getattr(self, "_tune_bcap_live", False):
+                    want_bcap = int(action.new_value)
+                    ctx.ack_action(action, int(self._bucket_cap_mb), want_bcap)
                 else:
                     ctx.ack_action(action, None, None, status="rejected")
         # Consensus over MPI (CPU) - never NCCL, so it cannot interleave with SP subgroup
@@ -929,10 +932,11 @@ class Trainer:
         # pickle-based lowercase allreduce would compare the lists lexicographically instead).
         if MPIUtils.size() > 1 and MPIUtils.is_mpi():
             from mpi4py import MPI
-            _buf = np.array([want_w, want_pf, want_accum], dtype=np.int64)
+            _buf = np.array([want_w, want_pf, want_accum, want_bcap], dtype=np.int64)
             _out = np.empty_like(_buf)
             MPIUtils.comm_world().Allreduce(_buf, _out, op=MPI.MAX)
-            want_w, want_pf, want_accum = int(_out[0]), int(_out[1]), int(_out[2])
+            want_w, want_pf, want_accum, want_bcap = (int(_out[0]), int(_out[1]),
+                                                      int(_out[2]), int(_out[3]))
         # INPUT knobs: apply the agreed values on every rank (symmetric -> no stragglers). Per-rank,
         # non-collective.
         new_w = want_w if want_w > SENT else None
@@ -949,6 +953,22 @@ class Trainer:
             if MPIUtils.rank() == 0:
                 log.info("COMM_OPT: accumulate_grad_batches %d -> %d (sync cadence)",
                          old_accum, want_accum)
+        # COMM knob #2: bucket_cap_mb. This one IS collective (the DDP rebuild broadcasts module
+        # state), which is exactly what deadlocked against the Ulysses SP all_to_all before. Make it
+        # safe by construction rather than by timing luck:
+        #   1. cuda.synchronize()  -> every rank drains its in-flight SP/DDP GPU collectives
+        #   2. MPI barrier (CPU)   -> all ranks arrive at the SAME point; cannot interleave with NCCL
+        #   3. rebuild             -> the broadcast is then the ONLY NCCL op anywhere in the job
+        #   4. MPI barrier         -> nobody resumes training until every rank holds the new wrapper
+        # want_bcap is already MPI-consensus so every rank rebuilds to the SAME value.
+        if (getattr(self, "_tune_bcap_live", False) and want_bcap > SENT
+                and want_bcap != int(self._bucket_cap_mb)):
+            torch.cuda.synchronize()
+            if MPIUtils.size() > 1 and MPIUtils.is_mpi():
+                MPIUtils.comm_world().Barrier()
+            self._rebuild_ddp(float(want_bcap))
+            if MPIUtils.size() > 1 and MPIUtils.is_mpi():
+                MPIUtils.comm_world().Barrier()
 
     @torch.no_grad()
     def validate_epoch(self, epoch):
@@ -1018,10 +1038,17 @@ class Trainer:
             bucket_cap_mb=new_bucket_cap_mb,
             mixed_precision=self._ddp_mixed_precision,
         )
-        # Re-register comm hook on new DDP wrapper
+        # Re-register comm hook on new DDP wrapper.
+        # BUGFIX (LIVEFLOW-STATUS.md sec 23.1): this closure previously OMITTED the
+        # _comm_sync_probe barrier that the setup_model hook has, so after any rebuild the
+        # straggler decomposition (probe=1) silently reverted to measuring transfer+skew.
         if (self._comm_timing or self._comm_optimize) and MPIUtils.size() > 1:
+            _sync_probe = os.environ.get("STORMER_COMM_SYNC_PROBE", "0") == "1"
+
             def _comm_hook(state, bucket):
                 torch.cuda.synchronize()
+                if _sync_probe:
+                    dist.barrier()
                 t0 = time.time()
                 work = dist.all_reduce(bucket.buffer(), async_op=True)
                 work.wait()
@@ -1172,6 +1199,43 @@ class Trainer:
                         },
                     )
                     _current["accumulate_grad_batches"] = int(self.accumulate_grad_batches)
+                # COMM knob #2: bucket_cap_mb. MATH-PRESERVING (changes only WHEN gradients are
+                # exchanged, never their values), unlike accum which changes the effective batch.
+                # Measured authority is large: 25 -> 400 MB is -36% wall / -66% comm at 4N
+                # (LIVEFLOW-STATUS.md sec 25.1). Applying it needs a DDP REBUILD, whose broadcast
+                # previously deadlocked against the Ulysses SP all_to_all. The fix is lockstep, not
+                # luck: cuda.synchronize() drains every rank's in-flight SP collective, then an MPI
+                # (CPU) barrier aligns ranks, and only THEN does the NCCL broadcast run -- so no SP
+                # collective can be in flight anywhere when the rebuild happens. See _apply_knobs.
+                # Opt-in (STORMER_TUNE_BUCKET_CAP=1), multi-rank only. step_mode=multiply because the
+                # useful range is geometric (25/50/100/200/400) and the Amdahl evidence formula
+                # computes a PARALLELISM target, which is meaningless for a size in MB.
+                _tune_bcap = (os.environ.get("STORMER_TUNE_BUCKET_CAP", "0") == "1"
+                              and MPIUtils.size() > 1)
+                self._tune_bcap_live = _tune_bcap
+                if _tune_bcap:
+                    knob_defs["bucket_cap_mb"] = knob(
+                        default=int(self._bucket_cap_mb),
+                        range=(int(os.environ.get("STORMER_KNOB_BCAP_MIN", "25")),
+                               int(os.environ.get("STORMER_KNOB_BCAP_MAX", "400"))),
+                        type=int,
+                        responds_to={
+                            "comm_optimization": {
+                                "direction": "increase",
+                                "step_mode": "multiply",
+                                # REQUIRED for multiply mode: planner.py:417 does
+                                # `old_value * response.step`, and KnobResponse.step defaults to
+                                # None -> TypeError. This is the FIRST multiply-mode knob in the
+                                # codebase, so that path had a latent crash nothing had hit.
+                                # step=2 gives the intended geometric ramp 25->50->100->200->400.
+                                "step": 2,
+                                "min_persistence": 1,
+                                "cooldown_windows": 3,
+                                "apply_when": "window_boundary",
+                            },
+                        },
+                    )
+                    _current["bucket_cap_mb"] = int(self._bucket_cap_mb)
                 built_defs = {
                     k: knob_def_from_dict(f"stormer.{k}", v, target_function="stormer.make_loader")
                     for k, v in knob_defs.items()
