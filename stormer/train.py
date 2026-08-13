@@ -79,6 +79,41 @@ from utils.perf_tracer import PerfTracer, PERFTRACER_ENABLE, dft_ai
 from utils.logging import configure_logging
 from utils.mpi import MPIUtils, get_master_addr_and_port
 
+# ---------------------------------------------------------------------------------------------
+# DECODE DOMAIN (LIVEFLOW-STATUS.md sec 36). Enabled by STORMER_TWOSTAGE=1 against a gzip+CHUNKED
+# ERA5 copy (see liveflow_validation/compress_era5.py). Splits the sample read into
+#   STAGE A storage: read_direct_chunk() -> raw compressed bytes   (h5py, sequential, not thread-safe)
+#   STAGE B decode : zlib.decompress                                (pure CPU, thread-safe, PARALLEL)
+# so `decode_threads` becomes a knob in its own domain, independent of `num_workers` (input).
+# Measured on real ERA5: 69 vars = 287 MB/sample, ~1110 ms inflate at 1 thread -> ~139 ms at 8.
+#
+# The pool is PER PROCESS (one per DataLoader worker) and persistent: building a pool per sample
+# would spawn threads 69x per step. It is resizable so the controller can retune it mid-run.
+import zlib
+from concurrent.futures import ThreadPoolExecutor
+
+_TWOSTAGE = os.environ.get("STORMER_TWOSTAGE", "0") == "1"
+_DECODE_POOL = None
+_DECODE_POOL_N = 0
+
+
+def _decode_pool():
+    """Persistent per-process decode pool. Returns None for n<=1 (inline decode, no threads)."""
+    global _DECODE_POOL, _DECODE_POOL_N
+    n = int(os.environ.get("STORMER_DECODE_THREADS", "1") or 1)
+    if n <= 1:
+        if _DECODE_POOL is not None:
+            _DECODE_POOL.shutdown(wait=False)
+            _DECODE_POOL, _DECODE_POOL_N = None, 1
+        return None
+    if _DECODE_POOL is None or _DECODE_POOL_N != n:
+        old = _DECODE_POOL
+        _DECODE_POOL = ThreadPoolExecutor(max_workers=n, thread_name_prefix="decode")
+        _DECODE_POOL_N = n
+        if old is not None:
+            old.shutdown(wait=False)     # retire AFTER the new pool exists (no decode gap)
+    return _DECODE_POOL
+
 
 warnings.filterwarnings("ignore", category=UserWarning)
 log = logging.getLogger(__name__)
@@ -254,14 +289,62 @@ class ERA5Dataset(Dataset):
             out_path = os.path.join(root_dir, f"{next_year}_{remaining_steps - 1:04}.h5")
         return out_path
 
+    def _read_two_stage(self, path: str, variables: list[str]):
+        """STAGE A (storage) then STAGE B (decode). Returns None if the data is not
+        chunked+compressed, so the caller falls back to the normal inline read."""
+        try:
+            with h5py.File(path, "r") as f:
+                grp = f["input"]
+                probe = grp[variables[0]]
+                if probe.chunks is None or probe.compression is None:
+                    return None                      # uncompressed data -> no decode domain
+                # ---- STAGE A: raw compressed bytes. Pure I/O, no inflate. Sequential because
+                # h5py is not thread-safe; it is also cheap (~0.7 ms/chunk vs ~16 ms to inflate).
+                # (no app region here: DFTracer's POSIX interception already attributes these
+                # reads to the reader_posix layer, which is the STORAGE signal the preset uses)
+                raw = []
+                for var in variables:
+                    d = grp[var]
+                    _mask, blob = d.id.read_direct_chunk((0,) * len(d.shape))
+                    raw.append((blob, d.shape, d.dtype))
+            # ---- STAGE B: inflate. Pure CPU, thread-safe, parallel across per-variable chunks.
+            # This is the DECODE domain; its width is the `decode_threads` knob.
+            def _inflate(item):
+                blob, shape, dtype = item
+                return np.frombuffer(zlib.decompress(blob), dtype=dtype).reshape(shape)
+
+            with dft_ai.data.decode:   # DECODE domain signal
+                pool = _decode_pool()
+                if pool is None:
+                    arrs = [_inflate(i) for i in raw]
+                else:
+                    arrs = list(pool.map(_inflate, raw))
+            return [a.reshape(1, *a.shape[-2:]) for a in arrs]
+        except Exception as e:
+            if MPIUtils.rank() == 0:
+                log.warning("two-stage read failed on %s (%s); falling back to inline",
+                            os.path.basename(path), type(e).__name__)
+            return None
+
     def get_data_given_path(self, path: str, variables: list[str]):
-        f = h5py.File(path, "r")
-        x = []
-        for var in variables:
-            d = f["input"][var][:]
-            x.append(d.reshape(1, *d.shape[-2:]))
-        f.close()
-        del f
+        # ------------------------------------------------------------------ TWO-STAGE (DECODE DOMAIN)
+        # STORMER_TWOSTAGE=1 with a gzip+CHUNKED dataset splits the read into two separately
+        # tunable stages, giving StorMer a third domain (LIVEFLOW-STATUS.md sec 36):
+        #   STAGE A (storage): read_direct_chunk() -> RAW COMPRESSED bytes, no inflate.
+        #   STAGE B (decode) : zlib.decompress, parallel across the per-variable chunks.
+        # Parallelism lives in stage B because that is where the cost is (measured: ~0.7 ms to read
+        # a chunk vs ~16 ms to inflate it) and because zlib-on-bytes is thread-safe while h5py is
+        # NOT -- so stage A stays sequential on a single file handle.
+        # Falls back to the inline path for uncompressed/unchunked data, so the default is unchanged.
+        x = self._read_two_stage(path, variables) if _TWOSTAGE else None
+        if x is None:                       # not enabled, or data not chunked/compressed
+            f = h5py.File(path, "r")
+            x = []
+            for var in variables:
+                d = f["input"][var][:]
+                x.append(d.reshape(1, *d.shape[-2:]))
+            f.close()
+            del f
 
         # STORMER_DROP_CACHE=1: evict this file from the OS page cache after reading so every
         # read stays COLD and the input pole is steady (does not self-relieve via cache warming).
@@ -905,7 +988,7 @@ class Trainer:
             return
         from live_data_loader import LiveDataLoader
         SENT = -1
-        want_w = want_pf = want_accum = want_bcap = SENT
+        want_w = want_pf = want_accum = want_bcap = want_dec = SENT
         ctx = self._optimizer_ctx
         if ctx is not None and not ctx._noop and isinstance(train_loader, LiveDataLoader):
             actions = ctx.drain_actions_for("stormer.make_loader", at="window_boundary") or []
@@ -925,6 +1008,10 @@ class Trainer:
                 elif knob_name == "bucket_cap_mb" and getattr(self, "_tune_bcap_live", False):
                     want_bcap = int(action.new_value)
                     ctx.ack_action(action, int(self._bucket_cap_mb), want_bcap)
+                elif knob_name == "decode_threads" and getattr(self, "_tune_decode_live", False):
+                    want_dec = int(action.new_value)
+                    ctx.ack_action(action, int(os.environ.get("STORMER_DECODE_THREADS", "1") or 1),
+                                   want_dec)
                 else:
                     ctx.ack_action(action, None, None, status="rejected")
         # Consensus over MPI (CPU) - never NCCL, so it cannot interleave with SP subgroup
@@ -932,15 +1019,31 @@ class Trainer:
         # pickle-based lowercase allreduce would compare the lists lexicographically instead).
         if MPIUtils.size() > 1 and MPIUtils.is_mpi():
             from mpi4py import MPI
-            _buf = np.array([want_w, want_pf, want_accum, want_bcap], dtype=np.int64)
+            _buf = np.array([want_w, want_pf, want_accum, want_bcap, want_dec], dtype=np.int64)
             _out = np.empty_like(_buf)
             MPIUtils.comm_world().Allreduce(_buf, _out, op=MPI.MAX)
-            want_w, want_pf, want_accum, want_bcap = (int(_out[0]), int(_out[1]),
-                                                      int(_out[2]), int(_out[3]))
+            want_w, want_pf, want_accum, want_bcap, want_dec = (int(_out[0]), int(_out[1]),
+                                                                int(_out[2]), int(_out[3]),
+                                                                int(_out[4]))
         # INPUT knobs: apply the agreed values on every rank (symmetric -> no stragglers). Per-rank,
         # non-collective.
+        # DECODE knob: the pool lives in each DataLoader WORKER process, which read
+        # STORMER_DECODE_THREADS from the environment they were forked with. So set the env in the
+        # parent and force a loader reconfigure -- the same actuator the input knobs already use --
+        # and the restarted workers pick up the new width. Ordered BEFORE the input apply so a
+        # simultaneous change costs ONE worker restart, not two.
+        _dec_changed = (getattr(self, "_tune_decode_live", False) and want_dec > SENT
+                        and want_dec != int(os.environ.get("STORMER_DECODE_THREADS", "1") or 1))
+        if _dec_changed:
+            _old_dec = os.environ.get("STORMER_DECODE_THREADS", "1")
+            os.environ["STORMER_DECODE_THREADS"] = str(want_dec)
+            if MPIUtils.rank() == 0:
+                log.info("DECODE_OPT: decode_threads %s -> %d", _old_dec, want_dec)
         new_w = want_w if want_w > SENT else None
         new_pf = want_pf if want_pf > SENT else None
+        if _dec_changed and new_w is None and new_pf is None and isinstance(train_loader, LiveDataLoader):
+            new_w = train_loader.num_workers      # no-op values: forces the restart that
+            new_pf = train_loader.prefetch_factor # propagates the new env to the workers
         if (new_w is not None or new_pf is not None) and isinstance(train_loader, LiveDataLoader):
             train_loader.reconfigure(num_workers=new_w, prefetch_factor=new_pf)
         # COMM knob: change the gradient-sync cadence by assignment. No collective. Clear any stale
@@ -1236,6 +1339,34 @@ class Trainer:
                         },
                     )
                     _current["bucket_cap_mb"] = int(self._bucket_cap_mb)
+                # THIRD DOMAIN: decode. Only meaningful with STORMER_TWOSTAGE=1 against a
+                # gzip+chunked dataset, where stage B (zlib inflate) is separately parallel from
+                # stage A (raw chunk I/O). Measured effect on real ERA5: 463 -> 86 ms/sample from
+                # 1 -> 16 threads. Math-safe: decoding is bit-identical regardless of width.
+                # `decode_threads` is already mapped to domain "decode" in clbo_planner._DOMAIN_OF.
+                _tune_dec = (os.environ.get("STORMER_TUNE_DECODE", "0") == "1" and _TWOSTAGE)
+                self._tune_decode_live = _tune_dec
+                if _tune_dec:
+                    knob_defs["decode_threads"] = knob(
+                        default=int(os.environ.get("STORMER_DECODE_THREADS", "1") or 1),
+                        range=(int(os.environ.get("STORMER_KNOB_DEC_MIN", "1")),
+                               int(os.environ.get("STORMER_KNOB_DEC_MAX", "16"))),
+                        type=int,
+                        responds_to={
+                            # decode pressure presents as fetch/input pressure to the existing
+                            # rules, so respond to the same tags until a decode-specific fact
+                            # rule exists (see LIVEFLOW-STATUS.md sec 36 next steps).
+                            "reader_parallelism": {
+                                "direction": "increase",
+                                "step_mode": "multiply",
+                                "step": 2,
+                                "min_persistence": 1,
+                                "cooldown_windows": 2,
+                                "apply_when": "window_boundary",
+                            },
+                        },
+                    )
+                    _current["decode_threads"] = int(os.environ.get("STORMER_DECODE_THREADS", "1") or 1)
                 built_defs = {
                     k: knob_def_from_dict(f"stormer.{k}", v, target_function="stormer.make_loader")
                     for k, v in knob_defs.items()
