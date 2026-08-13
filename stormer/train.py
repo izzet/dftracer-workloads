@@ -89,12 +89,26 @@ from utils.mpi import MPIUtils, get_master_addr_and_port
 #
 # The pool is PER PROCESS (one per DataLoader worker) and persistent: building a pool per sample
 # would spawn threads 69x per step. It is resizable so the controller can retune it mid-run.
+import atexit
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 
 _TWOSTAGE = os.environ.get("STORMER_TWOSTAGE", "0") == "1"
+
+# dft_ai.data exposes a FIXED set of regions (init/item/preprocess/derive/iter); an undeclared
+# name raises AttributeError. That is not loud -- _read_two_stage caught it and fell back to the
+# inline read, so the decode domain was silently INACTIVE in every run until this was found.
+# Declare the child region explicitly so `with dft_ai.data.decode:` is valid and emits
+# cat="data", func_name="decode" -- exactly what the stormer_xlayer preset's reader_decode
+# layer matches on.
+if _TWOSTAGE:
+    try:
+        dft_ai.data.create_children({"decode": "decode"})
+    except Exception:
+        pass    # NoOp tracer (PERFTRACER disabled) already tolerates any attribute
 _DECODE_POOL = None
 _DECODE_POOL_N = 0
+_TWOSTAGE_WARNED = False
 
 
 def _decode_pool():
@@ -111,8 +125,29 @@ def _decode_pool():
         _DECODE_POOL = ThreadPoolExecutor(max_workers=n, thread_name_prefix="decode")
         _DECODE_POOL_N = n
         if old is not None:
-            old.shutdown(wait=False)     # retire AFTER the new pool exists (no decode gap)
+            # wait=True, NOT False. Orphaned pool threads outlive the resize and are still alive
+            # when the interpreter finalizes, which races DFTracer's C-extension teardown and
+            # aborts the rank with
+            #   "PyThreadState_Get: ... the GIL is released ... runtime state: finalizing".
+            # Their work is already complete here (we only resize between samples), so waiting
+            # is free.
+            old.shutdown(wait=True)
     return _DECODE_POOL
+
+
+def _shutdown_decode_pool():
+    """Drain the decode pool BEFORE the interpreter (and DFTracer's C extension) finalize.
+    Registered with atexit so every DataLoader worker tears down cleanly."""
+    global _DECODE_POOL, _DECODE_POOL_N
+    if _DECODE_POOL is not None:
+        try:
+            _DECODE_POOL.shutdown(wait=True)
+        except Exception:
+            pass
+        _DECODE_POOL, _DECODE_POOL_N = None, 0
+
+
+atexit.register(_shutdown_decode_pool)
 
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -321,9 +356,14 @@ class ERA5Dataset(Dataset):
                     arrs = list(pool.map(_inflate, raw))
             return [a.reshape(1, *a.shape[-2:]) for a in arrs]
         except Exception as e:
-            if MPIUtils.rank() == 0:
-                log.warning("two-stage read failed on %s (%s); falling back to inline",
-                            os.path.basename(path), type(e).__name__)
+            # Do NOT call MPIUtils.rank() here: it asserts when MPI is not initialised, so the
+            # handler would raise while handling and mask the real error (and break every
+            # standalone/offline use of this reader).
+            global _TWOSTAGE_WARNED
+            if not _TWOSTAGE_WARNED:
+                _TWOSTAGE_WARNED = True
+                log.warning("two-stage read failed on %s (%s: %s); falling back to inline",
+                            os.path.basename(path), type(e).__name__, e)
             return None
 
     def get_data_given_path(self, path: str, variables: list[str]):
