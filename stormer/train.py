@@ -1353,10 +1353,13 @@ class Trainer:
                                int(os.environ.get("STORMER_KNOB_DEC_MAX", "16"))),
                         type=int,
                         responds_to={
-                            # decode pressure presents as fetch/input pressure to the existing
-                            # rules, so respond to the same tags until a decode-specific fact
-                            # rule exists (see LIVEFLOW-STATUS.md sec 36 next steps).
-                            "reader_parallelism": {
+                            # DEDICATED tag from stormer_xlayer.decode_pressure.v1. It must NOT be
+                            # `reader_parallelism`: that is num_workers' tag, and sharing it makes
+                            # decode pressure and input pressure indistinguishable to the planner,
+                            # which then fires BOTH knobs on ONE signal. Requires
+                            # DFANALYZER_PRESET=stormer_xlayer (only that preset defines the
+                            # reader_decode layer the rule reads).
+                            "decode_parallelism": {
                                 "direction": "increase",
                                 "step_mode": "multiply",
                                 "step": 2,
