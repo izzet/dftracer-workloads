@@ -53,11 +53,16 @@ class LiveDataLoader:
         self._inner_iter = None
         self._samples_yielded: int = 0
         self._pending_reconfigure: bool = False
+        # Batch produced by an EAGER apply (see apply_pending); handed out by the next __next__.
+        self._primed = None
+        self._primed_stop: bool = False
 
     def set_epoch(self, epoch: int):
         self._sampler.set_epoch(epoch)
         self._samples_yielded = 0
         self._pending_reconfigure = False
+        self._primed = None
+        self._primed_stop = False
         self._inner = self._build_inner()
         self._inner_iter = None
 
@@ -93,6 +98,54 @@ class LiveDataLoader:
             changed = True
         if changed:
             self._pending_reconfigure = True
+        return changed
+
+    def request_restart(self) -> bool:
+        """Request a worker respawn WITHOUT changing num_workers/prefetch_factor.
+
+        The decode knob lives in the worker processes' environment, so propagating a new value
+        needs the workers re-forked even though the loader's own parameters are unchanged.
+        reconfigure() cannot express that: it compares against the current values and returns
+        early, so passing the current values is a silent no-op. With num_workers == 0 there are no
+        worker processes and nothing to restart, so this is correctly a no-op there.
+        """
+        if self.num_workers <= 0:
+            return False
+        self._pending_reconfigure = True
+        return True
+
+    def apply_pending(self, prime: bool = True) -> bool:
+        """Materialise a pending reconfigure NOW, in the caller's synchronised window.
+
+        WHY THIS EXISTS (LIVEFLOW-DECODE-RCA.md sec 16). reconfigure() is a REQUEST: it sets a
+        flag. The expensive part -- tearing down the DataLoader and forking `num_workers` new
+        worker processes -- used to happen lazily in __next__, i.e. AFTER the caller's
+        time-symmetry barrier had already passed and reported "apply latency 0.0 ms". Each rank
+        therefore respawned its workers at a moment no rank had agreed on, with unbounded and
+        highly variable latency. The first rank to finish reached the next Ulysses-SP
+        dist.broadcast while its peers were still forking, sat in NCCL for 600 s, and the watchdog
+        aborted the job. A barrier can only certify work already done under it.
+
+        Calling this between the consensus and the barrier moves the whole cost inside the
+        protected window: stragglers then wait for each other in MPI (no watchdog, bounded by
+        arrival) instead of in NCCL (watchdog, fatal).
+
+        prime=True additionally pulls the first batch, so worker warm-up -- not just process
+        creation -- is inside the window too. The batch is buffered and handed to the next
+        __next__, so the sample stream is unchanged.
+
+        Returns True if an apply was performed.
+        """
+        if not self._pending_reconfigure:
+            return False
+        self._apply_reconfigure()
+        if prime:
+            try:
+                self._primed = next(self._inner_iter)
+            except StopIteration:
+                self._primed = None
+                self._primed_stop = True
+        return True
 
     def _apply_reconfigure(self):
         old_w = self._inner.num_workers if self._inner else "?"
@@ -112,9 +165,24 @@ class LiveDataLoader:
 
     def __iter__(self):
         self._inner_iter = iter(self._inner)
+        self._primed = None
+        self._primed_stop = False
         return self
 
     def __next__(self):
+        # A batch primed by an eager apply_pending() is handed out first, so the eager path costs
+        # the stream nothing. Kept BEFORE the pending check: apply_pending already cleared the flag.
+        if self._primed is not None:
+            batch = self._primed
+            self._primed = None
+            self._samples_yielded += self._batch_size or 1
+            return batch
+        if self._primed_stop:
+            self._primed_stop = False
+            raise StopIteration
+        # Fallback: a reconfigure that was requested but never materialised eagerly. This is the
+        # old lazy path and it is UNSAFE under peer-group collectives (sec 16) -- kept only so a
+        # caller that does not use apply_pending() still behaves correctly.
         if self._pending_reconfigure:
             self._apply_reconfigure()
 

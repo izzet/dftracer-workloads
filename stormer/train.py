@@ -35,7 +35,11 @@
 
 from typing import Any
 import logging
+import faulthandler
+import multiprocessing as _mp
 import os
+import signal
+import threading
 import time
 import contextlib
 import argparse
@@ -108,37 +112,307 @@ if _TWOSTAGE:
         pass    # NoOp tracer (PERFTRACER disabled) already tolerates any attribute
 _DECODE_POOL = None
 _DECODE_POOL_N = 0
+# Current decode concurrency LIMIT (the knob). The pool itself is fixed-width; this is what
+# decode_threads actually moves, so a change never creates or destroys a thread.
+#
+# SHARED MEMORY, not a module int (LIVEFLOW-STATUS sec 82). The decode limit is READ inside
+# DataLoader WORKER processes (_read_two_stage) and WRITTEN by the parent in _sync_apply_window.
+# As a plain int those are different copies: the parent's assignment never reached a running
+# worker, so the only way to deliver a new decode width was to RE-FORK the workers
+# (`request_restart`). That re-fork is what makes every worker re-initialise its Mofka client, and
+# an occasional child comes up with a connection whose pushes never return, starving a rank and
+# killing the job (sec 81). A multiprocessing.Value lives in an mmap segment inherited across
+# fork, so parent and workers read the SAME bytes and the knob applies with an integer store.
+#
+# lock=False: a single aligned int32. A torn read is not possible on x86-64/aarch64, and the value
+# is a concurrency hint anyway -- the worst case is one batch decoding at the previous width.
+# Created at import, i.e. before any worker is forked, which is what makes it inheritable.
+_DECODE_LIMIT = _mp.Value('i', 1, lock=False)
+_DECODE_POOL_PID = None
+
+
+def _ensure_decode_pool():
+    """Fixed-width decode pool, created ONCE at startup -- not lazily on the first read.
+
+    The previous version returned early for n<=1, so with DEC0=1 the pool was still built on the
+    first read AFTER the knob rose, i.e. mid-run against a live HIP stream -- the exact thing the
+    fixed-width design was supposed to eliminate. That made the D12 run a test of nothing.
+
+    Re-created when the pid changes: pool threads do not survive fork, so each DataLoader worker
+    needs its own. Same reinitialize-on-fork pattern DFTracer uses for its Mofka connection.
+    """
+    global _DECODE_POOL, _DECODE_POOL_N, _DECODE_POOL_PID
+    _pid = os.getpid()
+    if _DECODE_POOL is not None and _DECODE_POOL_PID == _pid:
+        return _DECODE_POOL
+    _wide = max(1, int(os.environ.get("STORMER_DECODE_THREADS_MAX", "16") or 16))
+    _DECODE_POOL = ThreadPoolExecutor(max_workers=_wide, thread_name_prefix="decode")
+    _DECODE_POOL_N = _wide
+    _DECODE_POOL_PID = _pid
+    # PRIME IT. ThreadPoolExecutor spawns worker threads LAZILY as tasks arrive, not at
+    # construction -- so merely building it up front still leaves the threads to appear later,
+    # mid-run, when the knob rises and more concurrent tasks are submitted. That is the very
+    # event being eliminated. Force all _wide threads into existence now, while nothing is in
+    # flight, by submitting one trivial task per worker and waiting for all of them.
+    try:
+        _barrier = threading.Barrier(_wide, timeout=30)
+        _futs = [_DECODE_POOL.submit(_barrier.wait) for _ in range(_wide)]
+        for _f in _futs:
+            _f.result(timeout=30)
+    except Exception:
+        pass    # priming is best-effort; a failure here must never block startup
+    return _DECODE_POOL
+# Pools retired by a live decode_threads resize. They are shut down non-blockingly at the swap and
+# JOINED at teardown (_shutdown_decode_pool), so the read path never waits on a thread join.
+_RETIRED_POOLS = []
 _TWOSTAGE_WARNED = False
+
+# ---- PROCESS-WIDE HANG INSTRUMENT (LIVEFLOW-STATUS.md sec 43.7) --------------------------------
+# The apply-window watchdog in _apply_knobs was scoped to the APPLY, and the evidence says the hang
+# is NOT there: the sec 43.5/43.6 runs logged "APPLY_SYNC: worst-rank apply latency 1.4 ms" -- the
+# apply finished and the barrier passed -- and then froze one step later, inside the training loop.
+# That fits the decode pool's LAZY resize: _apply_knobs only sets STORMER_DECODE_THREADS, and
+# _decode_pool() does the actual swap (including old.shutdown(wait=True)) on the NEXT read, inside
+# _read_two_stage. Scoping an instrument to where I ASSUMED the bug was is how two runs produced no
+# stack at all.
+#
+# Also note NO NCCL watchdog fired in either run even past its 600 s timeout, which means ALL ranks
+# were stuck, not a subset -- a genuine deadlock, not a straggler. So the instrument must be
+# process-wide and must not depend on any other rank making progress.
+#
+# SIGUSR1 costs nothing and allows an on-demand dump of every thread from outside.
+# STORMER_STACK_EVERY_SEC>0 additionally arms a periodic dump for diagnostic runs.
+# FATAL-SIGNAL TRACEBACK (LIVEFLOW-STATUS sec 80). `register(SIGUSR1)` and
+# `dump_traceback_later` only cover on-demand and periodic dumps; NEITHER installs a handler for
+# SIGSEGV. Two ranks died with "exited (Segmentation fault)" and produced no Python frame at all,
+# which is why the crashes were uninformative. enable() installs handlers for SIGSEGV/SIGBUS/
+# SIGFPE/SIGILL/SIGABRT and dumps every thread's Python stack to stderr before the process dies.
+# Forked DataLoader workers inherit it, so a crash inside a worker is covered too.
+faulthandler.enable(all_threads=True)
+faulthandler.register(signal.SIGUSR1, all_threads=True)
+_STACK_EVERY = float(os.environ.get("STORMER_STACK_EVERY_SEC", "0") or 0)
+if _STACK_EVERY > 0:
+    # repeat=True so successive dumps show whether the stack is stuck or merely slow.
+    # NOTE: a blind periodic dump also fires during HEALTHY operation. A run with this at 120 s
+    # froze at step 3 while two runs without it reached step 61, so 16 ranks periodically writing
+    # every thread's stack into one aggregated stderr is suspected of perturbing the job itself.
+    # Prefer the progress watchdog below, which only fires when progress actually stops.
+    faulthandler.dump_traceback_later(_STACK_EVERY, repeat=True, exit=False)
+
+# ---- PROGRESS WATCHDOG ------------------------------------------------------------------------
+# Dumps stacks ONLY when the training loop stops advancing, so it costs nothing while healthy and
+# cannot fire during warmup the way a periodic timer does. This is the instrument the sec 43.7
+# analysis called for: process-wide (the hang is in the reader, not the apply) and independent of
+# any other rank's progress (all ranks were stuck, so nothing external will notice).
+_LAST_PROGRESS_T = time.time()
+
+
+def _note_progress():
+    global _LAST_PROGRESS_T
+    _LAST_PROGRESS_T = time.time()
+
+
+# ---- APPLICATION FLIGHT RECORDER --------------------------------------------------------------
+# Why this exists (LIVEFLOW-STATUS.md sec 46): diagnosing a DISTRIBUTED stall needs a per-rank
+# TIMELINE, and neither instrument we had provides one.
+#   * NCCL's flight recorder logs collectives only -- it is silent when the stall is in application
+#     code, and silent entirely when work.wait() already returned.
+#   * A Python stack shows WHERE a rank is parked, not WHEN it diverged from the others. Four
+#     debugging cycles went to the comm hook because that is where the stack pointed; it was the
+#     symptom.
+# A ring of (monotonic time, phase, step, thread) per rank, dumped on stall, reconstructs who was
+# in which phase at which instant -- which is the only thing that distinguishes "this rank fell
+# behind" from "this rank never started".
+#
+# Two deliberate properties:
+#   NO LOCK. A lock here would add contention to the exact concurrency being investigated; a torn
+#   entry costs one bad row and is worth far more than a perturbed subject.
+#   PER-RANK FILE, not stderr. tqdm writes carriage returns to stderr and flux interleaves 16 ranks
+#   into one stream, which shredded every dump taken so far.
+_FLIGHT_SLOTS = int(os.environ.get("STORMER_FLIGHT_SLOTS", "8192") or 8192)
+_FLIGHT_ON = os.environ.get("STORMER_FLIGHT", "0") == "1"
+_FLIGHT = [None] * _FLIGHT_SLOTS
+_FLIGHT_I = 0
+
+
+def _fp(tag: str, step: int = -1):
+    """Record one phase marker. Deliberately branch-light: this sits on the training critical path."""
+    if not _FLIGHT_ON:
+        return
+    global _FLIGHT_I
+    i = _FLIGHT_I
+    _FLIGHT_I = i + 1
+    _FLIGHT[i % _FLIGHT_SLOTS] = (time.monotonic(), tag, step, threading.get_ident())
+
+
+def _flight_dump(reason: str):
+    """Dump the ring + every thread's stack to a PER-RANK file."""
+    try:
+        d = os.environ.get("STORMER_FLIGHT_DIR",
+                           f"/p/lustre5/{os.environ.get('USER','izzet')}/liveflow-validation/flight")
+        os.makedirs(d, exist_ok=True)
+        rank = os.environ.get("PMI_RANK") or os.environ.get("FLUX_TASK_RANK") or "x"
+        path = os.path.join(d, f"{os.uname()[1]}_r{rank}_p{os.getpid()}.flight")
+        with open(path, "a") as f:
+            f.write(f"\n===== FLIGHT DUMP reason={reason} t={time.monotonic():.3f} "
+                    f"decode_limit={_DECODE_LIMIT.value} =====\n")
+            n = min(_FLIGHT_I, _FLIGHT_SLOTS)
+            start = _FLIGHT_I - n
+            for k in range(start, _FLIGHT_I):
+                e = _FLIGHT[k % _FLIGHT_SLOTS]
+                if e:
+                    f.write(f"{e[0]:.6f} step={e[2]:<5} tid={e[3]} {e[1]}\n")
+            f.write("--- stacks ---\n")
+            f.flush()
+            faulthandler.dump_traceback(file=f, all_threads=True)
+            f.flush()
+    except Exception:
+        pass    # a recorder must never be able to break the run it is observing
+
+
+_STALL_SEC = float(os.environ.get("STORMER_STALL_DUMP_SEC", "0") or 0)
+_CDUMP_ARMED = False
+# C-LEVEL BACKSTOP. _stall_watch below is a PYTHON thread and therefore needs the GIL to run at
+# all. In the D20 capture only 4 of 16 ranks produced a dump: the ranks that matter -- the ones
+# actually wedged -- could not run their watchdog, which means something in those processes holds
+# the GIL continuously. (cuda.synchronize RELEASES the GIL, so they are not parked there.)
+# faulthandler's timer is a C thread and dumps WITHOUT the GIL, so it sees exactly the ranks the
+# Python watchdog cannot. Writing to the per-rank file, not stderr, so tqdm and 16-way interleaving
+# cannot shred it -- and at a long interval, unlike the 120 s periodic dump that perturbed D10.
+if _STALL_SEC > 0 and os.environ.get("STORMER_FLIGHT", "0") == "1":
+    try:
+        _d = os.environ.get("STORMER_FLIGHT_DIR",
+                            f"/p/lustre5/{os.environ.get('USER','izzet')}/liveflow-validation/flight")
+        os.makedirs(_d, exist_ok=True)
+        _rk = os.environ.get("PMI_RANK") or os.environ.get("FLUX_TASK_RANK") or "x"
+        _CFILE = open(os.path.join(_d, f"{os.uname()[1]}_r{_rk}_p{os.getpid()}.cdump"), "a")
+        faulthandler.dump_traceback_later(_STALL_SEC * 2, repeat=True, exit=False, file=_CFILE)
+        _CDUMP_ARMED = True
+    except Exception:
+        pass
+if _STALL_SEC > 0:
+    def _stall_watch():
+        import sys as _sys
+        dumped = 0
+        while dumped < 3:          # bounded: 3 dumps is enough to tell stuck from slow
+            time.sleep(15)
+            idle = time.time() - _LAST_PROGRESS_T
+            if idle > _STALL_SEC:
+                _sys.stderr.write(f"STALL_DUMP: no step progress for {idle:.0f}s "
+                                  f"(dump {dumped + 1}/3)\n")
+                _sys.stderr.flush()
+                # Ring + stacks to a PER-RANK FILE. The stderr copy above is only a breadcrumb;
+                # stderr is unusable for the actual payload (tqdm + 16 interleaved ranks).
+                _flight_dump(f"stall_{idle:.0f}s")
+                # NATIVE stack, not just Python frames.
+                #
+                # WHY THIS EXISTS. Every instrument so far stopped at the Python frame: we learn
+                # that a rank is inside `read_direct_chunk` and nothing about WHY. That call
+                # descends HDF5 -> POSIX -> DFTracer's interception -> Mofka producer ->
+                # Mercury/Argobots, and the fault has to be somewhere in there -- the stall is 8+
+                # minutes on ONE read, and the arms that stall are exactly the ones running the
+                # streaming pipeline against the node-local bedrock. Guessing at that boundary is
+                # what produced (and then retracted) three wrong root causes.
+                #
+                # eu-stack is run from a CHILD process attaching to us: a thread cannot reliably
+                # ptrace its own process, but a forked child can (ptrace_scope=0 here). h5py
+                # releases the GIL during I/O, which is why this watchdog thread gets scheduled at
+                # all while the main thread is blocked -- confirmed by diag1 producing 41 stall
+                # breadcrumbs from a wedged rank.
+                if os.environ.get("STORMER_NATIVE_STACK", "1") == "1":
+                    try:
+                        import subprocess as _sp
+                        _tool = None
+                        for _c in ("eu-stack", "pstack"):
+                            if _sp.run(["which", _c], capture_output=True).returncode == 0:
+                                _tool = _c
+                                break
+                        if _tool:
+                            # PROFILE THE WORKERS TOO, not just this process.
+                            #
+                            # The stall we are chasing lives in a DataLoader WORKER: an unmatched
+                            # [DFT_PUSH_ENTER] shows a forked child blocked inside a Mofka push
+                            # while its siblings push in 0 ms. Dumping only os.getpid() shows the
+                            # PARENT waiting for that worker's batch, which is the symptom, and
+                            # tells us nothing about why the worker's producer queue is not
+                            # draining. Enumerate our children and dump each of them as well.
+                            #
+                            # Observation only -- no behaviour change. The specific question this
+                            # has to answer is whether ActiveProducerBatchQueue::loop (the batch
+                            # sender) exists and is running in the stuck child, or whether it was
+                            # never scheduled after fork.
+                            _pids = [os.getpid()]
+                            try:
+                                _kids = os.path.join("/proc", str(os.getpid()),
+                                                     "task", str(os.getpid()), "children")
+                                with open(_kids) as _kf:
+                                    _pids += [int(x) for x in _kf.read().split()]
+                            except Exception:
+                                pass
+                            _nd = os.environ.get("STORMER_FLIGHT_DIR", "/tmp")
+                            _nrk = (os.environ.get("PMI_RANK")
+                                    or os.environ.get("FLUX_TASK_RANK") or "x")
+                            _out = os.path.join(
+                                _nd, f"{os.uname()[1]}_r{_nrk}_p{os.getpid()}.native")
+                            with open(_out, "a") as _fh:
+                                _fh.write(f"\n######## idle {idle:.0f}s dump {dumped + 1}: "
+                                          f"{len(_pids)} process(es) ########\n")
+                                for _tp in _pids:
+                                    _kind = "SELF" if _tp == os.getpid() else "WORKER"
+                                    try:
+                                        _r = _sp.run(
+                                            [_tool, "-p", str(_tp)] if _tool == "eu-stack"
+                                            else [_tool, str(_tp)],
+                                            capture_output=True, text=True, timeout=120)
+                                        _fh.write(f"\n==== {_kind} pid={_tp} {_tool} ====\n"
+                                                  f"{_r.stdout}\n{_r.stderr}\n")
+                                    except Exception as _pe:
+                                        _fh.write(f"\n==== {_kind} pid={_tp} FAILED: "
+                                                  f"{type(_pe).__name__}: {_pe} ====\n")
+                    except Exception as _e:
+                        _sys.stderr.write(f"NATIVE_STACK failed: {type(_e).__name__}: {_e}\n")
+                dumped += 1
+                time.sleep(_STALL_SEC)   # space the dumps so they show movement, not one instant
+    threading.Thread(target=_stall_watch, daemon=True, name="stallwatch").start()
 
 
 def _decode_pool():
-    """Persistent per-process decode pool. Returns None for n<=1 (inline decode, no threads)."""
-    global _DECODE_POOL, _DECODE_POOL_N
+    """Persistent per-process decode pool, sized ONCE; decode_threads is a CONCURRENCY LIMIT.
+
+    WHY NOT RESIZE THE POOL (LIVEFLOW-STATUS.md sec 43.8): creating/destroying pool threads while
+    GPU work is in flight wedged the job every time. The stall watchdog caught all 16 ranks blocked
+    at `torch.cuda.synchronize()` in the DDP comm hook (train.py `_comm_hook`), identical stacks at
+    182 s and 377 s, with the decode threads themselves IDLE. `work.wait()` had already returned --
+    which is why the NCCL watchdog never fired -- and the stream then never drained.
+
+    Crucially the CAPABILITY is fine: decode_threads=8 set at STARTUP ran 120/120 steps and gave
+    4.6x (sec 24). Only the mid-run TRANSITION breaks. So do not transition: allocate the widest
+    pool once and let the knob move a semaphore instead. Changing decode_threads then never touches
+    the thread set, which removes the trigger by construction.
+
+    A fixed pool + semaphore delivers the same thing the 4.6x came from -- concurrent inflate --
+    because the win is parallelism across the 69 per-variable chunks, not thread identity.
+    """
     n = int(os.environ.get("STORMER_DECODE_THREADS", "1") or 1)
-    if n <= 1:
-        if _DECODE_POOL is not None:
-            _DECODE_POOL.shutdown(wait=False)
-            _DECODE_POOL, _DECODE_POOL_N = None, 1
-        return None
-    if _DECODE_POOL is None or _DECODE_POOL_N != n:
-        old = _DECODE_POOL
-        _DECODE_POOL = ThreadPoolExecutor(max_workers=n, thread_name_prefix="decode")
-        _DECODE_POOL_N = n
-        if old is not None:
-            # wait=True, NOT False. Orphaned pool threads outlive the resize and are still alive
-            # when the interpreter finalizes, which races DFTracer's C-extension teardown and
-            # aborts the rank with
-            #   "PyThreadState_Get: ... the GIL is released ... runtime state: finalizing".
-            # Their work is already complete here (we only resize between samples), so waiting
-            # is free.
-            old.shutdown(wait=True)
-    return _DECODE_POOL
+    _DECODE_LIMIT.value = max(1, n)
+    # ALWAYS pooled, even at limit 1. Previously n<=1 ran inline in the calling thread and n>1 ran
+    # on the pool, so crossing 1->2 mid-run switched CODE PATH, not just a parameter -- a second
+    # discontinuity at exactly the transition that hangs. One path at every knob value removes it.
+    return _ensure_decode_pool()
 
 
 def _shutdown_decode_pool():
     """Drain the decode pool BEFORE the interpreter (and DFTracer's C extension) finalize.
     Registered with atexit so every DataLoader worker tears down cleanly."""
     global _DECODE_POOL, _DECODE_POOL_N
+    # Join the pools retired by a live resize FIRST. Blocking is safe here (teardown, no training
+    # loop to stall) and it preserves the invariant the inline wait=True was protecting: no pool
+    # thread is still alive when the interpreter and DFTracer's C extension finalize.
+    while _RETIRED_POOLS:
+        try:
+            _RETIRED_POOLS.pop().shutdown(wait=True)
+        except Exception:
+            pass
     if _DECODE_POOL is not None:
         try:
             _DECODE_POOL.shutdown(wait=True)
@@ -337,6 +611,7 @@ class ERA5Dataset(Dataset):
                 # h5py is not thread-safe; it is also cheap (~0.7 ms/chunk vs ~16 ms to inflate).
                 # (no app region here: DFTracer's POSIX interception already attributes these
                 # reads to the reader_posix layer, which is the STORAGE signal the preset uses)
+                _fp("readA.start")
                 raw = []
                 for var in variables:
                     d = grp[var]
@@ -348,12 +623,25 @@ class ERA5Dataset(Dataset):
                 blob, shape, dtype = item
                 return np.frombuffer(zlib.decompress(blob), dtype=dtype).reshape(shape)
 
+            _fp("readA.end/decode.start")
             with dft_ai.data.decode:   # DECODE domain signal
                 pool = _decode_pool()
                 if pool is None:
                     arrs = [_inflate(i) for i in raw]
                 else:
-                    arrs = list(pool.map(_inflate, raw))
+                    # The pool is sized WIDE and fixed (see _decode_pool); decode_threads is
+                    # enforced here as a concurrency limit. Chunking the submissions to the current
+                    # limit keeps at most _DECODE_LIMIT inflates running at once WITHOUT touching
+                    # the thread set, so raising or lowering the knob mid-run costs an integer
+                    # assignment instead of thread create/destroy against a live HIP stream.
+                    _lim = max(1, _DECODE_LIMIT.value)
+                    if _lim >= len(raw):
+                        arrs = list(pool.map(_inflate, raw))
+                    else:
+                        arrs = []
+                        for _i in range(0, len(raw), _lim):
+                            arrs.extend(pool.map(_inflate, raw[_i:_i + _lim]))
+            _fp("decode.end")
             return [a.reshape(1, *a.shape[-2:]) for a in arrs]
         except Exception as e:
             # Do NOT call MPIUtils.rank() here: it asserts when MPI is not initialised, so the
@@ -377,6 +665,7 @@ class ERA5Dataset(Dataset):
         # NOT -- so stage A stays sequential on a single file handle.
         # Falls back to the inline path for uncompressed/unchunked data, so the default is unchanged.
         x = self._read_two_stage(path, variables) if _TWOSTAGE else None
+        _fp("reader.return")   # our code done; what follows is collate/pin/loader handoff
         if x is None:                       # not enabled, or data not chunked/compressed
             f = h5py.File(path, "r")
             x = []
@@ -656,6 +945,15 @@ class Trainer:
         self.enable_progress_bar = self.args.enable_progress_bar
         self.variables = VARIABLES
         self.accumulate_grad_batches = self.args.accumulate_grad_batches
+        # Origin for the gradient-accumulation phase. The sync decision below used raw
+        # batch_idx, which is the PER-RANK loop counter: after a num_workers respawn a rank
+        # can yield a different number of batches, batch_idx drifts, and then
+        # `batch_idx % accum` differs across ranks -- some enter no_sync() while others run
+        # the gradient all_reduce, and the job deadlocks (LIVEFLOW-STATUS sec 74/75: 3 ranks
+        # past backward, 13 blocked inside it). Re-basing the phase on an origin that every
+        # rank stamps at the MPI-synchronised apply window makes the phase agree by
+        # construction. Harmless when accum == 1, which is why that case never wedged.
+        self._accum_origin = 0
 
         self.interval_combinations = None
         self.set_lat_lon(*self.datamodule.get_lat_lon())
@@ -904,6 +1202,7 @@ class Trainer:
 
     @dft_ai.compute.forward
     def forward_step(self, batch: Any):
+        _fp("fwd.start")
         x, gt_diff, interval = batch
 
         with self.forward_context():
@@ -923,6 +1222,7 @@ class Trainer:
 
     @dft_ai.compute.backward
     def backward_step(self, loss, batch_idx: int, n_accum_steps: int):
+        _fp("bwd.start")
         if self.scaler:
             self.scaler.scale(loss).backward()
         else:
@@ -945,13 +1245,16 @@ class Trainer:
     @dft_ai.compute
     def training_step(self, batch: Any, batch_idx: int):
         n_accum_steps = self.accumulate_grad_batches
+        # Phase relative to the last apply-window origin, NOT the raw per-rank batch_idx.
+        # Every rank stamps the same origin at a synchronisation point, so this agrees job-wide.
+        _phase = batch_idx - self._accum_origin
 
         # Only zero gradients at start of accumulation window
-        if ((batch_idx - 1) % n_accum_steps) == 0:
+        if ((_phase - 1) % n_accum_steps) == 0:
             self.optimizer.zero_grad(set_to_none=True)
 
         # Apply same sync context to forward + backward
-        if batch_idx % n_accum_steps != 0 and hasattr(self.net, "no_sync"):
+        if _phase % n_accum_steps != 0 and hasattr(self.net, "no_sync"):
             sync_context = self.net.no_sync()
         else:
             sync_context = contextlib.nullcontext()
@@ -980,7 +1283,7 @@ class Trainer:
                 torch.cuda.synchronize()
                 _t1 = time.time()
 
-            self.backward_step(loss, batch_idx, n_accum_steps)
+            self.backward_step(loss, _phase, n_accum_steps)
 
             if self._comm_timing or self._comm_optimize:
                 torch.cuda.synchronize()
@@ -989,10 +1292,41 @@ class Trainer:
         return loss_item.cpu().item()
 
     def _setup_optimizer_context(self):
-        """Initialize dfoptimizer context for knob registration and plan reception."""
+        """Initialize dfoptimizer context for knob registration and plan reception.
+
+        CONTEXT SCOPE (LIVEFLOW-STATUS.md sec 56). The Mofka client this creates is the confirmed
+        cause of the boundary-2 wedge: G1 ran 120/120 with the observation plane at FULL rate
+        (228 findings) and no in-rank context, while every arm carrying one died at step 48-49 in
+        `hipDeviceSynchronize` with the GPU stream undrained. The in-rank consumer competes with
+        NCCL's CPU-side proxy inside the same process, and no amount of external pinning reaches it.
+
+        Fewer clients is therefore the lever. This is safe because plan VALUES are already
+        distributed by the MPI `Allreduce(MAX)` in `_sync_apply_window`: a rank that drained nothing
+        contributes the -1 sentinel and adopts the agreed value. `_optimizer_active` is gated on the
+        rank-symmetric DFOPTIMIZER_ENABLE, not on holding a context, so every rank still joins that
+        collective -- which is what keeps the ranks in lockstep and is why this cannot deadlock.
+
+        per_node (default): one context per NODE. Plans are published to the NODE-LOCAL bedrock by
+            that node's optimizer, so a per-node consumer is the smallest scope that still receives
+            them; a single global consumer would never see the other nodes' plans.
+        all: previous behaviour, one per rank -- kept so the wedge stays reproducible on demand.
+        global: one for the whole job. Only correct if plans ever become globally published.
+        """
         self._optimizer_ctx = None
         if os.environ.get("DFOPTIMIZER_ENABLE", "0") != "1":
             return
+        _scope = os.environ.get("LIVEFLOW_CTX_SCOPE", "per_node").strip().lower()
+        if _scope != "all":
+            _local = os.environ.get("FLUX_TASK_LOCAL_ID")
+            if _local is None:
+                _ppn = max(1, int(os.environ.get("PPN", "4") or 4))
+                _local = MPIUtils.rank() % _ppn
+            _local = int(_local)
+            _holds = (MPIUtils.rank() == 0) if _scope == "global" else (_local == 0)
+            if not _holds:
+                log.debug("optimizer context skipped on rank %d (scope=%s)",
+                          MPIUtils.rank(), _scope)
+                return
         try:
             from dfoptimizer.runtime import optimizer_context
             group_file = os.environ.get("DFTRACER_MOFKA_GROUP_FILE", "")
@@ -1007,7 +1341,7 @@ class Trainer:
         except Exception as e:
             log0("WARNING: optimizer context setup failed: %s", e)
 
-    def _sync_apply_window(self, train_loader):
+    def _sync_apply_window(self, train_loader, step=None):
         """Apply optimizer plans SYMMETRICALLY across all ranks at a window boundary.
 
         The optimizer context is active on only a SUBSET of ranks and plans arrive at slightly
@@ -1057,6 +1391,18 @@ class Trainer:
         # Consensus over MPI (CPU) - never NCCL, so it cannot interleave with SP subgroup
         # collectives. Buffer-based Allreduce on a numpy array does an ELEMENT-WISE max (the
         # pickle-based lowercase allreduce would compare the lists lexicographically instead).
+        # UNCONDITIONAL PROBE (LIVEFLOW-STATUS sec 78). Everything below -- the consensus that
+        # makes every rank adopt the same knob values, and the barriers around the collective
+        # actuators -- is gated on this one condition. If it is False the gate fails SILENTLY:
+        # each rank then applies only what IT drained, so with per_node scope exactly the four
+        # context-holding ranks enter a collective DDP rebuild and the other twelve never do.
+        # That is precisely the sec 68 stack (ranks 0/4/8/12 in _verify_param_shape_across_processes).
+        # Log it once per window so the condition can never again be assumed.
+        if not getattr(self, "_consensus_probe_logged", False):
+            self._consensus_probe_logged = True
+            log.info("APPLY_CONSENSUS_PROBE: rank=%s size=%s is_mpi=%s -> consensus_%s",
+                     MPIUtils.rank(), MPIUtils.size(), MPIUtils.is_mpi(),
+                     "ON" if (MPIUtils.size() > 1 and MPIUtils.is_mpi()) else "OFF")
         if MPIUtils.size() > 1 and MPIUtils.is_mpi():
             from mpi4py import MPI
             _buf = np.array([want_w, want_pf, want_accum, want_bcap, want_dec], dtype=np.int64)
@@ -1065,6 +1411,49 @@ class Trainer:
             want_w, want_pf, want_accum, want_bcap, want_dec = (int(_out[0]), int(_out[1]),
                                                                 int(_out[2]), int(_out[3]),
                                                                 int(_out[4]))
+            # STEP-SKEW PROBE (LIVEFLOW-STATUS sec 77). Both wedges we have stacks for are
+            # consistent with ranks DISAGREEING ON THE STEP COUNT after a loader respawn:
+            #   - with accum>1, a step-count difference flips `batch_idx % accum`, so some ranks
+            #     enter no_sync() and others all_reduce (sec 74.2 split);
+            #   - with bucket_cap, ranks land on window boundaries at different times, so only a
+            #     SUBSET reaches the collective DDP rebuild (sec 68: 4 of 16).
+            # One int of MPI per window settles whether that premise is true instead of inferred.
+            if step is not None:
+                _sk = np.array([step, -step], dtype=np.int64)
+                _sko = np.empty_like(_sk)
+                MPIUtils.comm_world().Allreduce(_sk, _sko, op=MPI.MAX)
+                _smax, _smin = int(_sko[0]), -int(_sko[1])
+                if _smax != _smin and MPIUtils.rank() == 0:
+                    log.warning("STEP_SKEW: ranks disagree: min=%d max=%d spread=%d",
+                                _smin, _smax, _smax - _smin)
+        # Start the apply clock AFTER consensus: the Allreduce above is already synchronising, so
+        # including it would charge every rank the slowest rank's ARRIVAL time and hide the thing
+        # we actually want bounded -- how long the APPLY itself blocks this rank.
+        _fp("apply.start")
+        _t_apply0 = time.time()
+        # STACK WATCHDOG. When the apply blocks we need to know WHERE, not merely that it did. The
+        # sec 43.4 validation stalled with ZERO APPLY_SYNC lines and ZERO NCCL timeouts -- some rank
+        # stuck inside the apply while the others waited in the barrier below -- and nothing in the
+        # logs could name the blocking line. The time-symmetry barrier removes the NCCL watchdog
+        # (ranks wait in MPI, not NCCL), so it also removes the only diagnostic we had; this
+        # replaces it.
+        #
+        # dump_traceback_later fires on EVERY rank that overruns and prints EVERY thread's Python
+        # stack, so a decode-pool thread blocked in shutdown(wait=True) shows up by name. repeat=True
+        # so successive dumps reveal whether the stack is stuck or merely slow. exit=False so it
+        # only observes. Default 90 s: the apply is normally sub-millisecond, so this cannot fire in
+        # healthy operation. STORMER_APPLY_STACK_SEC=0 disables.
+        # Disabled when the process-wide periodic dump is active: both use the SAME single
+        # faulthandler timer, so arming here would reset it and the cancel below would DISARM the
+        # global one for the rest of the run -- a local safety net silently blinding a global
+        # instrument, which is the exact failure that made sec 43.5 undiagnosable.
+        # THIRD occurrence of the shared-timer trap: faulthandler has ONE timer, so arming and
+        # cancelling it here silently disarmed the C-level backstop at every window boundary --
+        # which is why D21 produced 16 open .cdump files and zero dumps.
+        _stack_sec = 0.0 if (_STACK_EVERY > 0 or _CDUMP_ARMED) else float(
+            os.environ.get("STORMER_APPLY_STACK_SEC", "90") or 0)
+        if _stack_sec > 0:
+            faulthandler.dump_traceback_later(_stack_sec, repeat=True, exit=False)
         # INPUT knobs: apply the agreed values on every rank (symmetric -> no stragglers). Per-rank,
         # non-collective.
         # DECODE knob: the pool lives in each DataLoader WORKER process, which read
@@ -1072,20 +1461,90 @@ class Trainer:
         # parent and force a loader reconfigure -- the same actuator the input knobs already use --
         # and the restarted workers pick up the new width. Ordered BEFORE the input apply so a
         # simultaneous change costs ONE worker restart, not two.
+        # ---- SAFETY GATE: RECOMMEND-ONLY KNOBS (LIVEFLOW-DECODE-RCA.md sec 15) ----------------
+        # An action is admissible only if (a) its expected benefit clears the evidence bar AND
+        # (b) its actuation path has a bounded, proven-safe apply. `decode_threads` passes (a) --
+        # attribution identifies it correctly and it is worth 4.6x when set at configuration time
+        # (D7, 120/120 steps) -- but fails (b): changing it ONLINE wedges the job, cause unknown
+        # after fourteen eliminated hypotheses (sec 14). The controller therefore COMPUTES and
+        # REPORTS the action and declines to apply it.
+        #
+        # This is a designed behaviour, not a workaround: a threshold-free controller needs a gate
+        # that bounds not only whether an action is WORTH taking but whether taking it can HARM the
+        # job. The recommendation is still evidence -- it shows attribution reaching the right
+        # conclusion -- while the gate keeps the run alive.
+        #
+        # DFOPTIMIZER_RECOMMEND_ONLY is a comma-separated knob list; empty restores full actuation.
+        _rec_only = {k.strip() for k in
+                     os.environ.get("DFOPTIMIZER_RECOMMEND_ONLY", "").split(",") if k.strip()}
         _dec_changed = (getattr(self, "_tune_decode_live", False) and want_dec > SENT
                         and want_dec != int(os.environ.get("STORMER_DECODE_THREADS", "1") or 1))
+        if _dec_changed and "decode_threads" in _rec_only:
+            if MPIUtils.rank() == 0:
+                log.info("SAFETY_GATE: decode_threads %s -> %d RECOMMENDED, not applied "
+                         "(actuation path not proven safe; see LIVEFLOW-DECODE-RCA.md sec 15)",
+                         os.environ.get("STORMER_DECODE_THREADS", "1"), want_dec)
+            _dec_changed = False        # attribution recorded; actuation withheld
         if _dec_changed:
             _old_dec = os.environ.get("STORMER_DECODE_THREADS", "1")
             os.environ["STORMER_DECODE_THREADS"] = str(want_dec)
+            # EAGER APPLY. Setting the env var alone defers the real change to whenever the next
+            # read happens -- mid-step, GPU in flight, at a point no rank agreed on. Materialise it
+            # HERE instead: every rank is already MPI-consensus on want_dec at this line, and the
+            # time-symmetry barrier below holds them together until all have done it. The pool is
+            # pre-built (see _ensure_decode_pool), so this is now an integer assignment, but doing
+            # it here means the transition instant is one every rank shares.
+            # Shared-memory store: every already-running worker sees this on its next read.
+            _DECODE_LIMIT.value = max(1, int(want_dec))
+            _ensure_decode_pool()
             if MPIUtils.rank() == 0:
-                log.info("DECODE_OPT: decode_threads %s -> %d", _old_dec, want_dec)
+                log.info("DECODE_OPT: decode_threads %s -> %d (applied at window boundary)",
+                         _old_dec, want_dec)
         new_w = want_w if want_w > SENT else None
         new_pf = want_pf if want_pf > SENT else None
-        if _dec_changed and new_w is None and new_pf is None and isinstance(train_loader, LiveDataLoader):
-            new_w = train_loader.num_workers      # no-op values: forces the restart that
-            new_pf = train_loader.prefetch_factor # propagates the new env to the workers
-        if (new_w is not None or new_pf is not None) and isinstance(train_loader, LiveDataLoader):
+        _is_live = isinstance(train_loader, LiveDataLoader)
+        _loader_changed = False
+        if (new_w is not None or new_pf is not None) and _is_live:
             train_loader.reconfigure(num_workers=new_w, prefetch_factor=new_pf)
+            _loader_changed = True
+        # NO RESTART FOR DECODE (LIVEFLOW-STATUS sec 82). This used to call request_restart(),
+        # because decode propagated through the worker ENVIRONMENT and only a re-fork could deliver
+        # a new value to running workers. `_DECODE_LIMIT` is now a shared-memory Value, so the
+        # store above is already visible in every worker on its next read -- the re-fork delivered
+        # nothing that the shared store does not, and it cost a full Mofka re-initialisation in
+        # every worker, which is where the sec 81 never-returning push comes from.
+        #
+        # Keeping this as an explicit no-op branch rather than deleting it: `_dec_changed` is still
+        # the signal that decode moved, and a future actuator that genuinely needs a respawn should
+        # be added here deliberately, not by resurrecting one.
+        if _dec_changed and new_w is None and new_pf is None and _is_live:
+            if MPIUtils.rank() == 0:
+                log.info("DECODE_OPT: applied via shared memory, no worker restart")
+        # ---- EAGER MATERIALISATION (LIVEFLOW-DECODE-RCA.md sec 16) ----------------------------
+        # THE fix for the sec 16 abort. reconfigure()/request_restart() only REQUEST; the teardown
+        # and the fork of `num_workers` worker processes used to happen lazily on the next fetch --
+        # after the time-symmetry barrier below had already passed and certified "apply 0.0 ms".
+        # Every rank then respawned at a moment no rank agreed on. The first to finish reached the
+        # next Ulysses-SP dist.broadcast alone, sat in NCCL 600 s, and the watchdog killed the job.
+        #
+        # Doing it HERE puts the whole cost -- process creation AND first-batch warm-up -- inside
+        # the window the barrier protects. Stragglers then wait for one another in MPI, which has
+        # no watchdog and costs delay instead of death, and APPLY_SYNC finally reports the real
+        # apply latency instead of the cost of a flag write.
+        # GATE (2026-08-21). The sec 16 abort this eager path was written to fix was itself a
+        # SYMPTOM of the control-plane bug fixed in LIVEFLOW-STATUS sec 61: sec 16.1 records that
+        # "rank 2 is the rank that received the num_workers=5 / prefetch_factor=5 plans -- the ONLY
+        # rank of 16 that did", i.e. each rank's consumer died after its first event, so ranks
+        # applied different knobs and fell out of SP lockstep. With delivery repaired every rank now
+        # gets every plan and the MPI consensus agrees the values, so the eager respawn may no
+        # longer be needed -- and it does a worker fork plus a blocking first-batch fetch INSIDE the
+        # control window, which is its own hazard. Default stays 1 (current behaviour); set
+        # STORMER_APPLY_EAGER=0 to restore the lazy path that worked in sec 35 (2026-08-11).
+        _eager = os.environ.get("STORMER_APPLY_EAGER", "1") == "1"
+        if _is_live and _eager and train_loader.apply_pending():
+            if MPIUtils.rank() == 0:
+                log.info("APPLY_EAGER: loader materialised in-window (workers=%s prefetch=%s)",
+                         train_loader.num_workers, train_loader.prefetch_factor)
         # COMM knob: change the gradient-sync cadence by assignment. No collective. Clear any stale
         # partial-accumulation gradients so the next accumulation window starts clean (mirrors the
         # self-contained heuristic in _comm_optimize_window).
@@ -1112,6 +1571,54 @@ class Trainer:
             self._rebuild_ddp(float(want_bcap))
             if MPIUtils.size() > 1 and MPIUtils.is_mpi():
                 MPIUtils.comm_world().Barrier()
+
+        # ---- ACCUMULATION-PHASE RE-ALIGNMENT (LIVEFLOW-STATUS.md sec 75) ----------------------
+        # Every rank reaches this point together (the Allreduce above blocks until all arrive), so
+        # stamping the origin here makes `batch_idx - _accum_origin` read the SAME value on every
+        # rank from now on, whatever per-rank drift a loader respawn introduced. Zero the gradients
+        # so the next accumulation window starts clean rather than mixing pre- and post-realignment
+        # partial sums. Both are no-ops in effect when accum == 1.
+        if _loader_changed and step is not None and self._accum_origin != step:
+            self._accum_origin = step
+            self.optimizer.zero_grad(set_to_none=True)
+            if MPIUtils.rank() == 0:
+                log.info("ACCUM_REALIGN: phase origin -> step %d (loader restarted)", step)
+
+        # ---- TIME-SYMMETRY BARRIER (LIVEFLOW-STATUS.md sec 42) --------------------------------
+        # The lockstep above protects the one knob whose ACTUATOR IS A COLLECTIVE (bucket_cap ->
+        # DDP rebuild broadcast). The input and decode knobs take the local path above and were
+        # deliberately left unguarded because they are "symmetric -> no stragglers".
+        #
+        # That reasoning conflates two different things: applying the same VALUE on every rank does
+        # not mean applying it takes the same TIME on every rank. A loader/decode-pool reconfigure
+        # can block one rank far longer than another (pool teardown, worker respawn, filesystem).
+        # The slow ranks then arrive late at the workload's OWN next SP all_to_all, the other ranks
+        # sit in that collective, and NCCL's 600 s watchdog kills the job. Measured directly with
+        # the flight recorder: 14 ranks at enqueued=3213, ranks 10 and 11 still at 3212 -- two ranks
+        # merely LATE, no collective misuse anywhere.
+        #
+        # One synchronising collective here removes the whole failure mode: no rank can enter the
+        # next NCCL op until every rank has finished applying, so lateness costs a delay instead of
+        # a deadlock. Allreduce(MAX) rather than Barrier() because it synchronises AND reports the
+        # worst-rank apply latency -- the quantity sec 42 says must stay well under the collective
+        # timeout, now measured every window instead of assumed.
+        #
+        # NOTE this is unconditional: every rank reaches it on every window boundary regardless of
+        # which knobs changed. A conditional sync would itself be an asymmetric collective, i.e.
+        # the exact bug it is here to prevent.
+        _fp("apply.end/barrier.enter")
+        if MPIUtils.size() > 1 and MPIUtils.is_mpi():
+            from mpi4py import MPI
+            _dt = np.array([(time.time() - _t_apply0) * 1000.0], dtype=np.float64)
+            _mx = np.empty_like(_dt)
+            MPIUtils.comm_world().Allreduce(_dt, _mx, op=MPI.MAX)
+            if MPIUtils.rank() == 0 and _mx[0] >= 1.0:
+                log.info("APPLY_SYNC: worst-rank apply latency %.1f ms", float(_mx[0]))
+        # Cancel AFTER the barrier, deliberately: a rank that finished its own apply but is stuck
+        # waiting here is also something we want to see, and its stack (blocked in Allreduce)
+        # distinguishes "I am the straggler" from "I am waiting for the straggler".
+        if _stack_sec > 0:
+            faulthandler.cancel_dump_traceback_later()
 
     @torch.no_grad()
     def validate_epoch(self, epoch):
@@ -1273,6 +1780,40 @@ class Trainer:
         # gating the collective on it keeps all ranks in lockstep (and leaves LiveIO/no-optimizer
         # runs byte-identical: no extra collective when it is off).
         self._optimizer_active = os.environ.get("DFOPTIMIZER_ENABLE", "0") == "1"
+
+        # RANK-SYMMETRIC ACTUATOR ENABLES (LIVEFLOW-STATUS sec 78). These were previously set ONLY
+        # inside `if self._optimizer_ctx and not self._optimizer_ctx._noop:` below, i.e. only on
+        # ranks that hold an optimizer context. Under CTX_SCOPE=per_node that is 4 ranks of 16, and
+        # the actuator gates read them as `getattr(self, "_tune_bcap_live", False)` -- so on the
+        # other twelve the attribute did not exist and silently defaulted to False.
+        #
+        # `bucket_cap_mb` actuates via `_rebuild_ddp`, whose `DDP.__init__` runs
+        # `_verify_param_shape_across_processes`, a WORLD collective. Four ranks entering it while
+        # twelve skip it is an unconditional deadlock -- exactly the stack in sec 68 and sec 78
+        # (ranks 0/4/8/12 blocked, the rest absent). The MPI consensus was working the whole time;
+        # what was asymmetric was permission to act on it.
+        #
+        # Every expression here depends only on env vars and MPIUtils.size(), both identical on
+        # every rank, so computing them unconditionally is what they always should have been. The
+        # assignments inside the context block below are now redundant but harmless (same values).
+        _sym_multi = MPIUtils.size() > 1
+        self._tune_comm_live = os.environ.get("STORMER_TUNE_COMM", "0") == "1" and _sym_multi
+        self._tune_bcap_live = os.environ.get("STORMER_TUNE_BUCKET_CAP", "0") == "1" and _sym_multi
+        self._tune_decode_live = (os.environ.get("STORMER_TUNE_DECODE", "0") == "1" and _TWOSTAGE)
+        # The shared-memory decode limit (sec 82) is only shared if workers are FORKED. Under
+        # 'spawn' each worker re-imports train.py and builds its OWN _DECODE_LIMIT, so the parent's
+        # store would reach nobody and decode would silently stop applying -- a wrong-answer bug,
+        # not a crash. Assert rather than assume.
+        _start_method = _mp.get_start_method(allow_none=True) or "fork"
+        if self._tune_decode_live and _start_method != "fork":
+            raise RuntimeError(
+                f"decode tuning needs the 'fork' start method for the shared _DECODE_LIMIT; "
+                f"got '{_start_method}'. Pin multiprocessing_context='fork' on the DataLoader "
+                f"or disable STORMER_TUNE_DECODE.")
+        if MPIUtils.rank() == 0:
+            log.info("ACTUATOR_ENABLES (rank-symmetric): comm=%s bcap=%s decode=%s start_method=%s",
+                     self._tune_comm_live, self._tune_bcap_live, self._tune_decode_live,
+                     _start_method)
 
         # Register knobs with optimizer (if context is active)
         if self._optimizer_ctx and not self._optimizer_ctx._noop:
@@ -1487,6 +2028,7 @@ class Trainer:
                 with logging_ctx():
                     _t_fetch0 = time.time()
                     for batch in dft_ai.dataloader.fetch.iter(train_loader):
+                        _fp("batch.received")   # loader returned an assembled batch
                         if self._comm_timing or self._comm_optimize:
                             _fetch_ms = (time.time() - _t_fetch0) * 1000
 
@@ -1546,12 +2088,14 @@ class Trainer:
                             pbar.update()
 
                         step += 1
+                        _fp("step.end", step)
+                        _note_progress()   # feeds the stall watchdog (module top)
                         dft_ai.update(epoch=epoch, step=step)
                         collate_profiler.update(epoch=epoch, step=step)
 
                         # Poll optimizer at window boundaries for mid-epoch reconfiguration
                         if step % _window_every_n == 0:
-                            self._sync_apply_window(train_loader)
+                            self._sync_apply_window(train_loader, step=step)
                             self._comm_optimize_window()
             finally:
                 # Epoch-level comm timing summary
