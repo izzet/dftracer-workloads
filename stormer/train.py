@@ -130,6 +130,43 @@ _DECODE_POOL_N = 0
 _DECODE_LIMIT = _mp.Value('i', 1, lock=False)
 _DECODE_POOL_PID = None
 
+# ---- EXPOSURE: per-stage service time reported BACK from the DataLoader workers ----------------
+#
+# liveflow_shm/EXPOSURE-PORT-DESIGN.md argues that attribution must use EXPOSURE (how long the
+# consumer stalled) rather than service time, because service time moves the wrong way when a
+# stage is relieved. For halo3d that is exact: the runtime owns both queues, so at the instant the
+# consumer blocks it can ask whether the upstream queue was empty (readers are the constraint,
+# STORAGE) or full (decoders are, DECODE).
+#
+# THAT TEST DOES NOT EXIST HERE, and the design document was wrong to say StorMer had "the same
+# in-process reader shape". Stage A and stage B run SERIALLY inside one DataLoader worker with no
+# queue between them, and the parent blocks on a single result queue. So:
+#
+#   the TOTAL exposure at next(loader) is exact
+#   the storage/decode SPLIT of it is estimated from the ratio of the two stage service times
+#
+# Only the RATIO is used, so a constant bias in either measurement cancels. Everything emitted
+# from it is flagged as an estimate (StallAccount(exact=False)) so it can never be mistaken for
+# the halo3d number.
+#
+# Shared memory rather than module floats, for the same reason _DECODE_LIMIT is: these are written
+# in forked worker processes and read in the parent, and a plain float would be a per-process copy
+# that never reaches the parent. Created at import, i.e. before any worker is forked.
+# lock=True because several workers increment concurrently and a lost update would bias the ratio.
+_STAGE_A_MS = _mp.Value('d', 0.0, lock=True)   # storage: read_direct_chunk
+_STAGE_B_MS = _mp.Value('d', 0.0, lock=True)   # decode: zlib inflate
+
+
+def _stage_times_drain():
+    """Read and reset the worker-reported stage times. Parent side, once per consumer stall."""
+    with _STAGE_A_MS.get_lock():
+        a = _STAGE_A_MS.value
+        _STAGE_A_MS.value = 0.0
+    with _STAGE_B_MS.get_lock():
+        b = _STAGE_B_MS.value
+        _STAGE_B_MS.value = 0.0
+    return a, b
+
 
 def _ensure_decode_pool():
     """Fixed-width decode pool, created ONCE at startup -- not lazily on the first read.
@@ -612,11 +649,16 @@ class ERA5Dataset(Dataset):
                 # (no app region here: DFTracer's POSIX interception already attributes these
                 # reads to the reader_posix layer, which is the STORAGE signal the preset uses)
                 _fp("readA.start")
+                _t_a = time.time()
                 raw = []
                 for var in variables:
                     d = grp[var]
                     _mask, blob = d.id.read_direct_chunk((0,) * len(d.shape))
                     raw.append((blob, d.shape, d.dtype))
+                # Reported to the parent through shared memory; only the ratio against stage B is
+                # used, to split the consumer's exposure between storage and decode.
+                with _STAGE_A_MS.get_lock():
+                    _STAGE_A_MS.value += (time.time() - _t_a) * 1000.0
             # ---- STAGE B: inflate. Pure CPU, thread-safe, parallel across per-variable chunks.
             # This is the DECODE domain; its width is the `decode_threads` knob.
             def _inflate(item):
@@ -624,6 +666,7 @@ class ERA5Dataset(Dataset):
                 return np.frombuffer(zlib.decompress(blob), dtype=dtype).reshape(shape)
 
             _fp("readA.end/decode.start")
+            _t_b = time.time()
             with dft_ai.data.decode:   # DECODE domain signal
                 pool = _decode_pool()
                 if pool is None:
@@ -641,6 +684,8 @@ class ERA5Dataset(Dataset):
                         arrs = []
                         for _i in range(0, len(raw), _lim):
                             arrs.extend(pool.map(_inflate, raw[_i:_i + _lim]))
+            with _STAGE_B_MS.get_lock():
+                _STAGE_B_MS.value += (time.time() - _t_b) * 1000.0
             _fp("decode.end")
             return [a.reshape(1, *a.shape[-2:]) for a in arrs]
         except Exception as e:
@@ -1987,6 +2032,44 @@ class Trainer:
         except Exception as e:
             log0("WARNING: Window init failed (no streaming analysis): %s", e)
 
+        # ---- EXPOSURE instrument (liveflow_shm/EXPOSURE-PORT-DESIGN.md) --------------------------
+        # Without this, the agent decides about StorMer's input side from dur_sum, which is
+        # per-operation service time summed across threads. It has been measured to move OPPOSITE
+        # to wall when a stage is relieved, so it cannot identify a bottleneck.
+        _stall_acct = None
+        _emit_stall = None
+        try:
+            import sys as _sys
+            for _p in (os.environ.get("LIVEFLOW_SHM_PYTHONPATH", ""),):
+                if _p and _p not in _sys.path:
+                    _sys.path.insert(0, _p)
+            from exposure import StallAccount, emit_stall_events
+            _stall_acct = StallAccount(exact=False)   # ratio split, see _STAGE_A_MS
+
+            def _emit_stall_events(n_steps):
+                """One event per domain per window per rank, from the MAIN process.
+
+                Accumulated, not per stall: per-stall emission would put tracer cost on the
+                critical path in proportion to how badly the loader is starving, and would give
+                dur_sum several events per window to sum, reintroducing the double count that
+                makes every other time layer unusable.
+                """
+                inst = PerfTracer.get_instance()
+
+                def _emit(name, cat, ms):
+                    if ms <= 0:
+                        return
+                    dur_us = int(ms * 1000)
+                    inst.log_event(name=name, cat=cat, start_time=inst.get_time() - dur_us,
+                                   duration=dur_us, int_args={}, float_args={}, string_args={})
+
+                emit_stall_events(_emit, _stall_acct.drain(), n_steps)
+
+            _emit_stall = _emit_stall_events
+            log0("EXPOSURE instrument armed (split is RATIO-ESTIMATED, not the halo3d queue test)")
+        except Exception as e:
+            log0("WARNING: exposure instrument unavailable: %s", e)
+
         for epoch in dft_ai.pipeline.epoch.iter(
             range(self.epochs),
             include_iter=False,
@@ -2029,8 +2112,18 @@ class Trainer:
                     _t_fetch0 = time.time()
                     for batch in dft_ai.dataloader.fetch.iter(train_loader):
                         _fp("batch.received")   # loader returned an assembled batch
-                        if self._comm_timing or self._comm_optimize:
-                            _fetch_ms = (time.time() - _t_fetch0) * 1000
+                        # UNCONDITIONAL now. This is the consumer-boundary exposure: the gap
+                        # between the end of the previous step and the batch arriving. With a
+                        # prefetching loader it is ~0 when the workers kept up, and it is the real
+                        # stall when they did not. It used to be computed only under comm timing,
+                        # so the quantity the attribution needs did not exist in a normal run.
+                        _fetch_ms = (time.time() - _t_fetch0) * 1000
+                        if _stall_acct is not None and _fetch_ms > 0:
+                            _sa, _sb = _stage_times_drain()
+                            _tot = _sa + _sb
+                            # No stage evidence: charge storage rather than invent a split. Dropping
+                            # it would understate the domain and read like a loader that kept up.
+                            _stall_acct.add_split(_fetch_ms, 1.0 if _tot <= 0 else _sa / _tot)
 
                         if self.max_training_step != -1 and step > self.max_training_step:
                             log0(f"Training step limit reached: {self.max_training_step}")
@@ -2078,9 +2171,15 @@ class Trainer:
                                     100 * a2a_ms / total_ms if total_ms > 0 else 0,
                                     100 * _fetch_ms / total_ms if total_ms > 0 else 0,
                                 )
-                            _t_fetch0 = time.time()
+                        # Reset unconditionally: the exposure measurement above needs it in
+                        # every run, not only when comm timing is on.
+                        _t_fetch0 = time.time()
 
                         if _window is not None:
+                            # Exposure into the trace BEFORE the window closes, so the window the
+                            # analyzer is about to analyse carries the stall it must explain.
+                            if _emit_stall is not None and step % _window_every_n == 0:
+                                _emit_stall(_window_every_n)
                             _window.stop()
 
                         if pbar:
