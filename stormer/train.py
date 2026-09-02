@@ -2200,8 +2200,6 @@ def main() -> None:
     os.makedirs(log_folder, exist_ok=True)
     configure_logging(output_dir=log_folder)
 
-    dftracer_logger = None  # set by pfwlogger below
-
     if DEVICE_TYPE != "cuda":
         raise RuntimeError("Stormer training requires a CUDA/ROCm GPU environment.")
 
@@ -2250,8 +2248,6 @@ def main() -> None:
         data_dir=args.data_folder,
         process_id=MPIUtils.rank(),
     )
-    dftracer_logger = pfwlogger
-
     with dft_ai:
         model = Stormer(
             in_img_size=args.in_img_size,
@@ -2280,8 +2276,6 @@ def main() -> None:
         trainer.finalize()
 
     pfwlogger.finalize()
-    if dftracer_logger is not None:
-        dftracer_logger.finalize()
     if dist_initialized:
         dist.barrier()
         dist.destroy_process_group()
