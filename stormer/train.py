@@ -2026,7 +2026,17 @@ class Trainer:
         _window_every_n = int(os.environ.get("STORMER_WINDOW_EVERY_N", "0") or 0) or max(_n_steps_eff // 5, 1)
         try:
             from dfoptimizer.runtime import Window
-            _window = Window(PerfTracer.get_instance(), max_every_n=self.n_steps)
+            # HORIZON CONTRACT (liveflow_shm/HORIZON-CONTRACT.md). epochs_total and steps_per_epoch
+            # are the two facts only the application knows; steps_per_epoch is _n_steps_eff (the
+            # max_training_step cap, not the raw sampler length), matching the cadence derivation
+            # above so windows_per_epoch (derived at emit time from the live cadence, never stored)
+            # is arithmetically consistent with how many windows this run actually produces.
+            _window = Window(
+                PerfTracer.get_instance(),
+                max_every_n=self.n_steps,
+                epochs_total=self.epochs,
+                steps_per_epoch=_n_steps_eff,
+            )
             _window.update_cadence(_window_every_n)
             log0("Window initialized (every_n=%s)", _window.every_n)
         except Exception as e:
@@ -2078,6 +2088,10 @@ class Trainer:
             pbar = None
             try:
                 log0(f"Epoch: {epoch}")
+                # Horizon contract: stamp epoch_index (one based) BEFORE the loader is built, so
+                # the boundary that carries a staging decision already knows which epoch it is in.
+                if _window is not None:
+                    _window.set_epoch(epoch + 1)
                 train_loader, train_sampler = self.make_loader(epoch=epoch)
 
                 self.net.train()
