@@ -724,7 +724,10 @@ class ERA5Dataset(Dataset):
         x = self._read_two_stage(path, variables) if _TWOSTAGE else None
         _fp("reader.return")   # our code done; what follows is collate/pin/loader handoff
         if x is None:                       # not enabled, or data not chunked/compressed
-            f = h5py.File(path, "r")
+            try:
+                f = h5py.File(path, "r")
+            except OSError as exc:
+                raise OSError(f"could not open StorMer sample {path}: {exc}") from exc
             x = []
             for var in variables:
                 d = f["input"][var][:]
