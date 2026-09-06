@@ -228,6 +228,14 @@ def get_master_addr_and_port(port: Optional[int] = None, lc_machine: bool = True
         if set_env:
             os.environ["MASTER_ADDR"] = hostname
             os.environ["MASTER_PORT"] = str(port)
+    elif os.environ.get("MASTER_ADDR") and os.environ.get("MASTER_PORT"):
+        # No MPI to broadcast rank 0's choice, so the LAUNCHER must have chosen. Without this branch
+        # every rank computed its own port: rank 0 bound 23456 and every other rank then found it
+        # taken, picked a random free port and waited on it until the TCPStore timeout (measured on
+        # Corona 2026-09-05, job f5zHLEmF1KV1: ranks 1-7 each on a different port, 10 minutes of
+        # nothing). The env values are used verbatim; nothing is probed.
+        hostname = os.environ["MASTER_ADDR"]
+        port = int(os.environ["MASTER_PORT"])
     else:
         hostname = get_hostname()
         if lc_machine:
