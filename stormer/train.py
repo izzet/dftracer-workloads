@@ -633,6 +633,18 @@ class ERA5Dataset(Dataset):
             else:
                 next_year = year_list[year_idx_map[year] + 1]
             out_path = os.path.join(root_dir, f"{next_year}_{remaining_steps - 1:04}.h5")
+            if not os.path.exists(out_path):
+                # Both the same-year forward guesses and the next-year fallback are absent: this
+                # only happens against a sparse/non-contiguous file set (e.g. a randomly-sampled
+                # subset directory), where the dense-per-year assumption above does not hold. Fail
+                # loudly and name the missing file, instead of handing h5py.File() a path that
+                # does not exist and letting a bare FileNotFoundError surface deep in the read path.
+                raise FileNotFoundError(
+                    f"get_out_path: no forward-reference target exists for {year}_{inp_file_idx:04} "
+                    f"(steps={steps}) under {root_dir}; last candidate tried: {out_path}. "
+                    f"The file set under root_dir is not densely populated per year (a sampled "
+                    f"subset directory, not the full corpus) -- use a time-contiguous subset."
+                )
         return out_path
 
     def _read_two_stage(self, path: str, variables: list[str]):
