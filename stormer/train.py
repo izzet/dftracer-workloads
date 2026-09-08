@@ -1117,6 +1117,8 @@ class Trainer:
 
         # --- Communication timing and optimization ---
         self._comm_timing = os.environ.get("STORMER_COMM_TIMING", "0") == "1"
+        # Opt in. See the COMM_TIMING_RANK emitter in the training loop for why it exists.
+        self._comm_timing_all_ranks = os.environ.get("STORMER_COMM_TIMING_ALL_RANKS", "0") == "1"
         self._comm_optimize = os.environ.get("STORMER_COMM_OPTIMIZE", "0") == "1"
         self._comm_bucket_ms = []  # filled by hook, cleared per step
         self._fwd_ms = 0.0
@@ -2139,6 +2141,14 @@ class Trainer:
 
                 with logging_ctx():
                     _t_fetch0 = time.time()
+                    # WHERE THE WINDOW BEGINS. `for batch in ...` has already blocked on the fetch
+                    # by the time the body runs, so a window opened inside the body excludes the
+                    # fetch that opened it while the stall drained at its close includes it. On
+                    # `stgi_capacity_gate1` that put 11.96 s of stall inside a 36.42 s wall which
+                    # did not contain it and the domains summed to 131 percent of the window
+                    # (STATUS-ATTRIBUTION-FIX-2026-09-08.md, defect C2). This is the instant the
+                    # previous step ended, on the tracer's own clock.
+                    _win_open_at = _window.now() if _window is not None else None
                     for batch in dft_ai.dataloader.fetch.iter(train_loader):
                         _fp("batch.received")   # loader returned an assembled batch
                         # UNCONDITIONAL now. This is the consumer-boundary exposure: the gap
@@ -2159,7 +2169,7 @@ class Trainer:
                             break
 
                         if _window is not None:
-                            _window.start()
+                            _window.start(at_time=_win_open_at)
 
                         if self._comm_timing or self._comm_optimize:
                             torch.cuda.synchronize()
@@ -2189,6 +2199,23 @@ class Trainer:
                             # Feed per-step data to comm optimizer (include loss for convergence tracking)
                             _loss_val = loss if isinstance(loss, float) else float("nan")
                             self._comm_window_steps.append((step_ms, comm_ms, n_buckets, _loss_val))
+                            if self._comm_timing and MPIUtils.rank() != 0 and self._comm_timing_all_ranks:
+                                # PER-RANK GROUND TRUTH, opt in (STORMER_COMM_TIMING_ALL_RANKS=1).
+                                #
+                                # The line below prints from rank 0 only, so it can validate a
+                                # decomposition of the TYPICAL rank and nothing else. Our
+                                # `domain_*_time_proc_crit` is the vector of the rank on the
+                                # critical path through the data pipeline, and on this shape that
+                                # is not rank 0: two of eight ranks stall 4.9 to 18.3 s on the
+                                # loader while the other six stall 0.35 and wait the same time at
+                                # the barrier instead (STATUS-ATTRIBUTION-FIX-2026-09-08.md
+                                # section 2). Without this there is no instrument outside our
+                                # pipeline that sees that rank at all. A DIFFERENT prefix, so every
+                                # parser of the rank-0 line keeps reading exactly what it read.
+                                log.info(
+                                    "COMM_TIMING_RANK r=%d e=%d s=%d total=%.0f fetch=%.0f step=%.0f comm=%.0f",
+                                    MPIUtils.rank(), epoch, step, total_ms, _fetch_ms, step_ms, comm_ms,
+                                )
                             if MPIUtils.rank() == 0 and self._comm_timing:
                                 # exposed comm = DDP all_reduce (bwd, usually hidden) + SP a2a (fwd, non-overlappable)
                                 _exposed_comm = comm_ms + a2a_ms
@@ -2203,6 +2230,8 @@ class Trainer:
                         # Reset unconditionally: the exposure measurement above needs it in
                         # every run, not only when comm timing is on.
                         _t_fetch0 = time.time()
+                        # Same instant, on the tracer's clock, for the window that opens next.
+                        _win_open_at = _window.now() if _window is not None else None
 
                         if _window is not None:
                             # Exposure into the trace BEFORE the window closes, so the window the
@@ -2249,11 +2278,26 @@ class Trainer:
                         avg_loss,
                     )
 
+                # CLOSE THE TRAINING WINDOW BEFORE VALIDATION, AND DRAIN THE STALL INTO IT.
+                #
+                # Two defects lived here (STATUS-ATTRIBUTION-FIX-2026-09-08.md, defect C3). The
+                # stall accumulator was drained only on `step % every_n == 0`, and a 200-step epoch
+                # at cadence 24 never hits that on its last step, so the epoch's tail stall was
+                # never emitted: the epoch's LAST window carried no `stall.storage` event at all,
+                # which is ABSENCE rather than zero, so the planner silently took the
+                # fetch-minus-decode fallback there, and the undrained tail then leaked into the
+                # FIRST window of the next epoch. And `flush()` ran after `validate_epoch`, so that
+                # last window's wall swallowed the whole validation pass, which emits none of the
+                # four domains. Together they are why windows 9 and 18 of `stgi_capacity_gate1`
+                # report domains summing to 28 and 14 percent of their wall while their neighbours
+                # report 99.
+                if _window is not None:
+                    if _emit_stall is not None:
+                        _emit_stall(_window_every_n)
+                    _window.flush()
+
                 # Validation at end of epoch
                 self.validate_epoch(epoch)
-
-                if _window is not None:
-                    _window.flush()
                 if pbar:
                     pbar.close()
                 dft_ai.pipeline.epoch.stop(metadata=True)
