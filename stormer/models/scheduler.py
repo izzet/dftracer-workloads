@@ -128,7 +128,31 @@ def configure_lr_scheduler(
     num_nodes: int,
     **kwargs,  # accept any params
 ):
-    n_steps = int(n_steps / (num_devices * num_nodes))
+    """`n_steps` is `len(train_sampler)` at the call site (train.py), and a PyTorch
+    `DistributedSampler.__len__` is ALREADY the per-rank shard size
+    (`ceil(len(dataset) / world_size)`), not the global dataset size. This function used to divide
+    that already-per-rank count by `num_devices * num_nodes` a second time, which shrank
+    `n_steps` by another factor of world size and made `warmup_epochs` (`warmup_epochs_arg *
+    n_steps`) both node-count-dependent and, on every shape this project has run
+    (`warmup_epochs_arg=10 > EPOCHS<=3` always), LARGER than `max_epochs`
+    (`max_epochs_arg * n_steps`) -- inverting the cosine-annealing denominator
+    `max_epochs - warmup_epochs` to negative. `LinearWarmupCosineAnnealingLR` is a CHAINABLE
+    scheduler (each step's LR is a delta from the current value, not an absolute formula), and its
+    cosine branches divide by `(1 + cos(...))`, which can approach zero and blow the LR up when the
+    period is wrong; because the update is relative, one bad step compounds into every step after
+    it. At 4 Corona nodes this bug put the warmup/cosine boundary at step ~110 of a 200-step run,
+    matching where a real run's `comm`/`fetch` broke down (`STATUS-STORMER-4NODE-BALANCE-
+    2026-09-08.md`) and its loss diverged (`STATUS-STORMER-DIVERGENCE-DIAGNOSIS-2026-09-08.md`).
+    FIXED (2026-09-08): `n_steps` is used as passed, with no second division, so `warmup_epochs`
+    stays the intended `warmup_epochs_arg` real training epochs' worth of per-rank steps --
+    thousands, on this subset, at any node count. This does NOT make `warmup_epochs < max_epochs`
+    true (that inequality is `warmup_epochs_arg(10) < EPOCHS`, a separate, still-hardcoded
+    relationship this fix does not touch): what it restores is that `warmup_epochs` is now large
+    enough that no run of 200 steps or fewer, at any node count this project uses, ever crosses
+    into the cosine-annealing branch at all, which is the property that actually kept the schedule
+    safe. See `liveflow_shm/tests/test_scheduler_warmup.py` for the regression test and the
+    informational check that documents `warmup_epochs > max_epochs` remaining true.
+    """
     lr_scheduler = LinearWarmupCosineAnnealingLR(
         optimizer=optimizer,
         warmup_epochs=warmup_epochs * n_steps,
