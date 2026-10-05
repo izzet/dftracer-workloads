@@ -57,6 +57,24 @@ _KNOBS[0] = max(0, _env_int("LIVEFLOW_LAYOUT_TRANSFER_MB", 0)) * _MB
 _KNOBS[1] = max(1, _env_int("LIVEFLOW_LAYOUT_READ_THREADS", 1))
 _KNOBS[2] = max(0, _env_int("LIVEFLOW_LAYOUT_GAP_KB", 1024)) * 1024
 
+# LIVEFLOW_READ_DONTNEED=1 (default off): after a sample file has been completely read into private memory, ask the kernel to
+# drop its clean page-cache pages (posix_fadvise DONTNEED).  Math-neutral: it runs strictly AFTER the bytes were copied out of
+# the file (h5py ``d[:]`` / preadv into private buffers; no mmap), never writes, and a failure is ignored.  Stall-diag 2026-10-05:
+# tests whether page-cache pressure causes the arm-position effect.
+_DONTNEED = _env_int("LIVEFLOW_READ_DONTNEED", 0) == 1 and hasattr(os, "posix_fadvise")
+
+
+def _dontneed(paths) -> None:
+    for p in set(paths):
+        try:
+            fd = os.open(p, os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+
 
 def set_layout(transfer_mb: Optional[int] = None, read_threads: Optional[int] = None,
                gap_kb: Optional[int] = None) -> dict:
@@ -108,11 +126,20 @@ def _emit(rec: dict) -> None:
 # --------------------------------------------------------------------------- default (today's) path
 def _read_default(path: str, variables: Sequence[str], group: Optional[str]):
     f = h5py.File(path, "r")
+    files = {path}
     try:
         g = f[group] if group else f
-        return [g[v][:] for v in variables]
+        out = []
+        for v in variables:
+            d = g[v]
+            out.append(d[:])
+            if _DONTNEED:
+                files.add(d.file.filename)  # the file that actually holds the bytes (ExternalLink targets)
     finally:
         f.close()
+    if _DONTNEED:
+        _dontneed(files)
+    return out
 
 
 # --------------------------------------------------------------------------- coalesced path
@@ -219,6 +246,8 @@ def _read_coalesced(path: str, variables: Sequence[str], group: Optional[str], t
             lat = list(_pool(nthr).map(timed, calls))
     finally:
         os.close(fd)
+    if _DONTNEED:
+        _dontneed([target])
     t2 = time.perf_counter()
     out = [None] * len(variables)
     for si, (s, t, es) in enumerate(spans):
