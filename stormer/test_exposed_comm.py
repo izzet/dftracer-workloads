@@ -72,6 +72,13 @@ def test_exposed_does_not_mutate_state():
     assert len(state) == 1
 
 
+def test_exposed_vs_reference():
+    assert comm_hook.exposed_vs_reference_ms(267.0, 85.0) == 182.0
+    assert comm_hook.exposed_vs_reference_ms(80.0, 85.0) == 0.0
+    assert comm_hook.exposed_vs_reference_ms(267.0, None) == 0.0
+    assert comm_hook.exposed_vs_reference_ms(None, 85.0) == 0.0
+
+
 def test_record_backward_end_is_none_outside_event_modes(monkeypatch):
     monkeypatch.setenv("STORMER_COMM_PROBE", "blocking")
     assert comm_hook.record_backward_end() is None

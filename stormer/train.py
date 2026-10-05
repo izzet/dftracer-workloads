@@ -33,7 +33,7 @@
 #
 # This codebase is for single step pretraining only and no validation
 
-from typing import Any
+from typing import Any, Optional
 from functools import partial
 import hashlib
 import json
@@ -47,6 +47,7 @@ import sys
 import threading
 import time
 import contextlib
+import statistics
 import argparse
 import tempfile
 from glob import glob
@@ -1594,6 +1595,8 @@ class Trainer:
         self._comm_bucket_ms = []  # filled by hook, cleared per step
         self._fwd_ms = 0.0
         self._bwd_ms = 0.0
+        self._bwd_only_ms = 0.0
+        self._c0_bwd_ms = None
         self._bucket_cap_mb = _bucket_cap if MPIUtils.size() > 1 else 25.0
         self._comm_window_steps = []  # per-step (step_ms, comm_ms, n_buckets) for current window
         self._comm_cooldown = 0  # windows to skip after a change
@@ -1733,6 +1736,9 @@ class Trainer:
     @dft_ai.compute.forward
     def forward_step(self, batch: Any):
         _fp("fwd.start")
+        return self._forward_loss(batch)
+
+    def _forward_loss(self, batch: Any):
         x, gt_diff, interval = batch
 
         with self.forward_context():
@@ -1760,14 +1766,22 @@ class Trainer:
         if self._trajectory_retention is not None:
             self._last_observed_optimizer_update = False
         _fp("bwd.start")
+        _time_bwd = (self._comm_timing or self._comm_optimize) and self._c0_active()
+        if _time_bwd:
+            torch.cuda.synchronize()
+            _tb = time.time()
         if self.scaler:
             self.scaler.scale(loss).backward()
         else:
             loss.backward()
+        if _time_bwd:
+            torch.cuda.synchronize()
+            self._bwd_only_ms = (time.time() - _tb) * 1000
 
-        # Exposed comm is completion-based: this event completes only after the last all-reduce
-        # (DDP's finalize_backward stream-waits on every comm future before backward() returns);
-        # it is compared with the last bucket's `ready` event in comm_hook.compute_exposed_comm_ms.
+        # Tail diagnostic only (comm_hook.compute_exposed_comm_ms): this event completes after the last
+        # all-reduce (DDP's finalize_backward stream-waits on every comm future before backward() returns).
+        # The production exposed-comm value is backward wall minus the comm-free reference, see
+        # _calibrate_compute_only_backward.
         self._bwd_end_event = comm_hook.record_backward_end()
 
         # Only step optimizer at end of accumulation window
@@ -1800,6 +1814,51 @@ class Trainer:
             # all-tensor finiteness check only at selected epoch-end points.
             if self._trajectory_retention is not None:
                 self._last_observed_optimizer_update = True
+
+    def _c0_active(self) -> bool:
+        """The completion-based exposed-comm measure applies (event/ab probe, DDP over more than one rank)."""
+        return comm_hook.comm_probe_mode() in ("event", "ab") and MPIUtils.size() > 1
+
+    def _calibrate_compute_only_backward(self, batch) -> Optional[float]:
+        """Median wall (ms) of a backward pass with NO gradient communication, measured once.
+
+        Exposed comm = the backward wall of a real step minus this reference. The all-reduce does not show
+        up as a tail after backward on this system (last-bucket ready -> backward() returned read 5.7 ms
+        while the paired counterfactual gave 168-182 ms at 16N): it appears as DILATION of the backward
+        compute itself, so only a comm-free reference separates it. Math-neutral: forward and backward on the
+        first real batch inside DDP `no_sync()` (no collective for the gradients), gradients dropped, the
+        torch/CUDA RNG states restored, parameter and optimizer state asserted unchanged by digest.
+        Symmetric on every rank (same code path, SP collectives in forward run on all ranks)."""
+        if not hasattr(self.net, "no_sync"):
+            return None
+        from rebuild_invariants import state_digest
+        before = state_digest(self.net.module, self.optimizer)
+        cpu_rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        self.optimizer.zero_grad(set_to_none=True)
+        walls = []
+        try:
+            with self.net.no_sync():
+                for _ in range(5):
+                    loss, _li = self._forward_loss(batch)
+                    torch.cuda.synchronize()
+                    t0 = time.time()
+                    (self.scaler.scale(loss) if self.scaler else loss).backward()
+                    torch.cuda.synchronize()
+                    walls.append((time.time() - t0) * 1000)
+                    self.optimizer.zero_grad(set_to_none=True)
+        finally:
+            self.optimizer.zero_grad(set_to_none=True)
+            torch.set_rng_state(cpu_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state_all(cuda_rng)
+        after = state_digest(self.net.module, self.optimizer)
+        if before != after:
+            raise RuntimeError("comm calibration changed model/optimizer state")
+        c0 = statistics.median(walls[1:])
+        log0("COMM_CALIBRATION compute_only_backward_ms=%.3f samples=%s state_digest_equal=True",
+             c0, ",".join("%.1f" % w for w in walls))
+        return c0
 
     @dft_ai.compute
     def training_step(self, batch: Any, batch_idx: int):
@@ -3214,6 +3273,13 @@ class Trainer:
                             sample_ids = batch[3]
                             batch = batch[:3]
                         batch = self.send_to_device(batch)
+                        if (self._c0_bwd_ms is None and (self._comm_timing or self._comm_optimize)
+                                and self._c0_active() and not getattr(self, "_c0_tried", False)):
+                            self._c0_tried = True
+                            try:
+                                self._c0_bwd_ms = self._calibrate_compute_only_backward(batch)
+                            except Exception as _exc:
+                                log0("COMM_CALIBRATION failed (%r); exposed comm reads 0", _exc)
                         if comm_hook.comm_probe_mode() == "ab":
                             _ab_mode = comm_hook.ab_advance()
                             _ab_cap = comm_hook.ab_cap_now(self._bucket_cap_mb)
@@ -3237,8 +3303,8 @@ class Trainer:
                             # compute_exposed_comm_ms's docstring).
                             exposed_comm_ms = 0.0
                             if comm_hook.comm_probe_mode() in ("event", "ab"):
-                                exposed_comm_ms = comm_hook.compute_exposed_comm_ms(
-                                    self._comm_bucket_ms, getattr(self, "_bwd_end_event", None))
+                                exposed_comm_ms = comm_hook.exposed_vs_reference_ms(
+                                    self._bwd_only_ms, self._c0_bwd_ms)
                             if _se_on:
                                 _se_exposed.append(exposed_comm_ms)
                             if PERFTRACER_ENABLE:

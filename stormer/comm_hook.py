@@ -122,8 +122,21 @@ def record_backward_end():
     return ev
 
 
+def exposed_vs_reference_ms(backward_ms, compute_only_ms) -> float:
+    """Exposed comm = backward wall of a real step minus the comm-free backward reference (ms, >= 0).
+
+    The reference is measured once at the start of the run (train.py `_calibrate_compute_only_backward`:
+    first batch, DDP `no_sync()`, gradients dropped, RNG restored). 0.0 while no reference exists.
+    Verified against the paired skip-all-reduce counterfactual at 16N (inventory/consolidate/comm-verify):
+    the last-bucket tail below reads ~6 ms there because communication shows up as a DILATION of the
+    backward compute, not as a wait after it."""
+    if compute_only_ms is None or backward_ms is None:
+        return 0.0
+    return max(0.0, float(backward_ms) - float(compute_only_ms))
+
+
 def compute_exposed_comm_ms(state, backward_end=None) -> float:
-    """Exposed comm (event/ab modes): the time the step WAITS for all-reduce completion beyond
+    """TAIL diagnostic (event/ab modes): the time the step WAITS for all-reduce completion beyond
     backward compute, i.e. from the instant the LAST bucket's gradients became ready to the
     instant `backward()` returned.
 
@@ -138,7 +151,8 @@ def compute_exposed_comm_ms(state, backward_end=None) -> float:
     ready(last) -> backward_end is the completion-based exposed time: ~0 when communication was
     fully hidden, the unhidden tail (plus any all-reduce backlog behind it) otherwise.
 
-    CORRECTION (2026-10-04, comm-exposure worker + consolidation): the earlier version measured
+    NOTE (2026-10-04, consolidation): this tail is NOT the exposed-comm value used by the loop (see
+    `exposed_vs_reference_ms`); at 16N it reads ~6 ms against a 168-182 ms counterfactual. The earlier version measured
     `ready(last) -> end(last)`, where `end` is recorded right after the all-reduce is ISSUED
     (async), so it read the LAUNCH cost, 3-4 ms, while the paired counterfactual (all-reduce
     skipped) showed 136-212 ms exposed at 16N/32N (inventory/comm-exposure). The 2026-09-27
