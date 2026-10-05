@@ -2324,12 +2324,19 @@ class Trainer:
         # want_bcap is already MPI-consensus so every rank rebuilds to the SAME value.
         if (getattr(self, "_tune_bcap_live", False) and want_bcap > SENT
                 and want_bcap != int(self._bucket_cap_mb)):
+            _ta = time.perf_counter()
             torch.cuda.synchronize()
+            _tb = time.perf_counter()
             if MPIUtils.size() > 1 and MPIUtils.is_mpi():
                 MPIUtils.comm_world().Barrier()
+            _tc = time.perf_counter()
             self._rebuild_ddp(float(want_bcap))
+            _td = time.perf_counter()
             if MPIUtils.size() > 1 and MPIUtils.is_mpi():
                 MPIUtils.comm_world().Barrier()
+            log.info("REBUILD_APPLY_PHASES rank=%d sync_s=%.6f barrier1_s=%.6f rebuild_s=%.6f barrier2_s=%.6f "
+                     "since_apply_start_s=%.6f", MPIUtils.rank(), _tb - _ta, _tc - _tb, _td - _tc,
+                     time.perf_counter() - _td, time.time() - _t_apply0)
 
         # ---- ACCUMULATION-PHASE RE-ALIGNMENT (LIVEFLOW-STATUS.md sec 75) ----------------------
         # Every rank reaches this point together (the Allreduce above blocks until all arrive), so
@@ -2648,6 +2655,7 @@ class Trainer:
         module = self.net.module
         old_cap = self._bucket_cap_mb
         self._rebuild_ok = True
+        _entry_t0 = time.perf_counter()
         _verify = os.environ.get("STORMER_REBUILD_VERIFY", "1") == "1"
         _problem = rebuild_invariants.boundary_problem(self.accumulate_grad_batches)
         if _problem is not None:
@@ -2655,16 +2663,37 @@ class Trainer:
             self._rebuild_ok = False
             log.error("REBUILD_REFUSED: %s", _problem)
             return
-        _before = rebuild_invariants.state_digest(module, self.optimizer) if _verify else None
+        _impl = os.environ.get("STORMER_REBUILD_IMPL", "fast")
+        _phases = {}
+        _init_sync = True
         _rebuild_t0 = time.perf_counter()
         self._bucket_cap_mb = new_bucket_cap_mb
-        self.net = DDP(
-            module,
-            device_ids=[DEVICE_ID],
-            output_device=DEVICE_ID,
-            bucket_cap_mb=new_bucket_cap_mb,
-            mixed_precision=self._ddp_mixed_precision,
-        )
+        if _impl == "fast":
+            # Device-side fingerprint (not the host SHA-256 copy of the whole model and Adam state), and no
+            # parameter broadcast when every rank already holds identical state; same process group,
+            # broadcast_buffers and all other DDP arguments (see rebuild_invariants.fast_rewrap).
+            self.net, _info = rebuild_invariants.fast_rewrap(
+                module, self.optimizer, DDP,
+                dict(device_ids=[DEVICE_ID], output_device=DEVICE_ID, bucket_cap_mb=new_bucket_cap_mb,
+                     mixed_precision=self._ddp_mixed_precision),
+                MPIUtils.comm_world() if (MPIUtils.size() > 1 and MPIUtils.is_mpi()) else None,
+                verify=_verify)
+            _phases, _init_sync = _info["phases"], _info["init_sync"]
+            _before, _after, _digest_ok = _info["before"], _info["after"], _info["ok"]
+        else:
+            _t_ph = time.perf_counter()
+            _before = rebuild_invariants.state_digest(module, self.optimizer) if _verify else None
+            _phases["digest_before"] = time.perf_counter() - _t_ph
+            _rebuild_t0 = time.perf_counter()
+            _t_ph = time.perf_counter()
+            self.net = DDP(
+                module,
+                device_ids=[DEVICE_ID],
+                output_device=DEVICE_ID,
+                bucket_cap_mb=new_bucket_cap_mb,
+                mixed_precision=self._ddp_mixed_precision,
+            )
+            _phases["ddp_init"] = time.perf_counter() - _t_ph
         # Re-register comm hook on new DDP wrapper.
         # BUGFIX (LIVEFLOW-STATUS.md sec 23.1): this closure previously OMITTED the
         # _comm_sync_probe barrier that the setup_model hook has, so after any rebuild the
@@ -2677,19 +2706,28 @@ class Trainer:
                 self._comm_bucket_ms,
                 comm_hook.make_hook_for_mode(dft_ai.comm.all_reduce, self._comm_sync_probe))
         if _verify:
-            _after = rebuild_invariants.state_digest(self.net.module, self.optimizer)
-            if _after != _before:
+            if _impl != "fast":
+                _t_ph = time.perf_counter()
+                _after = rebuild_invariants.state_digest(self.net.module, self.optimizer)
+                _phases["digest_after"] = time.perf_counter() - _t_ph
+                _digest_ok = (_after == _before)
+            if not _digest_ok:
                 self._rebuild_ok = False
                 log.error("REBUILD_INVARIANT_FAILED: state digest changed across DDP rebuild "
                           "(%s -> %s)", _before[:12], _after[:12])
             else:
                 log0("REBUILD_INVARIANT_OK: state digest %s", _after[:12])
         log0("COMM_OPT: rebuilt DDP bucket_cap_mb=%.0f→%.0f", old_cap, new_bucket_cap_mb)
-        # Rank-local wall of the DDP re-wrap and hook re-registration only (digest checks excluded from the
-        # subtraction on purpose: they are part of what a live rebuild costs).  The measured input to a
-        # declared STORMER_BCAP_REBUILD_COST_S; a diagnostic line, never consumed by the controller.
+        # Rank-local wall of the whole re-wrap (fingerprint/digest checks included: they are part of what a live
+        # rebuild costs).  The measured input to a declared STORMER_BCAP_REBUILD_COST_S; a diagnostic line,
+        # never consumed by the controller.  REBUILD_PHASES splits it (device-synchronised laps).
+        _cost = time.perf_counter() - _rebuild_t0
         log.info("REBUILD_COST_S rank=%d from=%.0f to=%.0f seconds=%.6f",
-                 MPIUtils.rank(), old_cap, new_bucket_cap_mb, time.perf_counter() - _rebuild_t0)
+                 MPIUtils.rank(), old_cap, new_bucket_cap_mb, _cost)
+        log.info("REBUILD_PHASES rank=%d impl=%s init_sync=%d wall_s=%.6f cost_s=%.6f %s", MPIUtils.rank(), _impl,
+                 int(_init_sync), time.perf_counter() - _entry_t0, _cost,
+                 " ".join("%s=%.6f" % kv for kv in _phases.items()))
+        self._first_step_after_rebuild = True
 
     def _comm_optimize_window(self):
         """Evaluate comm metrics for the completed window and tune knobs."""
@@ -3117,6 +3155,11 @@ class Trainer:
                            int_args={"epoch": _TAG_INT(epoch), "step": _TAG_INT(step)},
                            float_args={}, string_args={})
 
+        _force_rebuilds = {}
+        for _tok in os.environ.get("STORMER_FORCE_REBUILD", "").split(","):
+            if _tok.strip():
+                _fe, _fs, _fc = _tok.strip().split(":")
+                _force_rebuilds[(int(_fe), int(_fs))] = float(_fc)
         for epoch in dft_ai.pipeline.epoch.iter(
             range(self.epochs),
             include_iter=False,
@@ -3291,7 +3334,26 @@ class Trainer:
                             if _ab_cap != self._bucket_cap_mb:
                                 # symmetric on every rank (same step counter); outside backward
                                 self._rebuild_ddp(_ab_cap)
+                        # Test/measurement hook (default off): STORMER_FORCE_REBUILD="epoch:step:cap,..." rebuilds
+                        # DDP at that epoch-local step on every rank (same cap = a no-op rebuild), outside backward.
+                        _force = _force_rebuilds.get((epoch, step))
+                        if _force is not None:
+                            torch.cuda.synchronize()
+                            if MPIUtils.size() > 1 and MPIUtils.is_mpi():
+                                MPIUtils.comm_world().Barrier()
+                            _t_fr = time.perf_counter()
+                            self._rebuild_ddp(float(_force))
+                            if MPIUtils.size() > 1 and MPIUtils.is_mpi():
+                                MPIUtils.comm_world().Barrier()
+                            log.info("FORCED_REBUILD epoch=%d step=%d cap=%s wall_s=%.6f rank=%d", epoch, step,
+                                     _force, time.perf_counter() - _t_fr, MPIUtils.rank())
+                        _t_fs = time.perf_counter() if getattr(self, "_first_step_after_rebuild", False) else None
                         loss = self.training_step(batch, step)
+                        if _t_fs is not None:
+                            torch.cuda.synchronize()
+                            self._first_step_after_rebuild = False
+                            log.info("FIRST_STEP_AFTER_REBUILD epoch=%d step=%d seconds=%.6f rank=%d", epoch, step,
+                                     time.perf_counter() - _t_fs, MPIUtils.rank())
                         if sample_ids is not None:
                             import hashlib, json
                             indices = torch.as_tensor(sample_ids).reshape(-1).tolist()
