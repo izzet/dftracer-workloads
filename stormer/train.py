@@ -786,6 +786,11 @@ class ERA5Dataset(Dataset):
 
         file_paths = glob(os.path.join(root_dir, "*.h5"))
         file_paths = sorted(file_paths)
+        # Opt-in (cached-regime study): keep only the first N sorted files of the TRAIN split (a
+        # time-contiguous prefix; the last steps*max(interval)//freq of them stay target-only).
+        _subset_n = int(os.environ.get("STORMER_TRAIN_SUBSET_FILES", "0") or 0)
+        if _subset_n > 0 and os.path.basename(os.path.normpath(root_dir)) == "train":
+            file_paths = file_paths[:_subset_n]
 
         final_file_paths: list[str] = []
         if self.year_list is not None:

@@ -5,6 +5,9 @@ so that a newly-created DataLoader can resume from the exact sample position
 after a num_workers change.
 """
 
+import os
+
+import torch
 from torch.utils.data.sampler import Sampler
 from torch.utils.data.distributed import DistributedSampler
 
@@ -22,8 +25,23 @@ class LiveSampler(Sampler):
 
     def set_epoch(self, epoch: int):
         self._epoch = epoch
-        self._dist_sampler.set_epoch(epoch)
-        self._indices = list(self._dist_sampler)
+        if os.environ.get("STORMER_SAMPLER_SHARD", "") == "block-fixed":
+            # Opt-in (cached-regime study): rank r owns the SAME contiguous index block every
+            # epoch (so a node's page cache can hold its share); only the order inside the
+            # block is reshuffled per epoch, from (seed, epoch).  Default (unset) is unchanged:
+            # DistributedSampler re-partitions all indices across ranks every epoch.
+            n = len(self._dist_sampler.dataset)
+            reps, rank = self._dist_sampler.num_replicas, self._dist_sampler.rank
+            if n % reps:
+                raise ValueError(f"block-fixed sharding needs len(dataset)={n} divisible by {reps}")
+            blk = n // reps
+            g = torch.Generator()
+            g.manual_seed(self._dist_sampler.seed + epoch)
+            perm = torch.randperm(blk, generator=g).tolist()
+            self._indices = [rank * blk + i for i in perm]
+        else:
+            self._dist_sampler.set_epoch(epoch)
+            self._indices = list(self._dist_sampler)
         self._offset = 0
 
     @property
