@@ -3574,6 +3574,16 @@ class Trainer:
                     preserve_trajectory_state=self._trajectory_retention is not None,
                 )
 
+            # Opt-in (cached-regime study, STORMER_APPLY_AT_EPOCH_END=1): apply pending plans at the epoch
+            # boundary. The in-loop apply point is a window boundary (_window.stop()); once the window is
+            # sized (about 30 s) it exceeds a short epoch, and flush() closes the epoch window outside
+            # the loop, so a plan produced from it was never drained or applied. Called by every rank at
+            # the same program point after validation (the flush window's plan has arrived by then).
+            if (os.environ.get("STORMER_APPLY_AT_EPOCH_END", "0") == "1" and _window is not None
+                    and epoch + 1 < self.epochs):
+                self._loop_step = step
+                self._sync_apply_window(train_loader, step=step)
+
         if self._per_rep_step_writer is not None:
             self._per_rep_step_writer.close()
         self._finish_trajectory_retention()
