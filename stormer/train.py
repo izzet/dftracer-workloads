@@ -3274,6 +3274,9 @@ class Trainer:
                         # stall when they did not. It used to be computed only under comm timing,
                         # so the quantity the attribution needs did not exist in a normal run.
                         _fetch_ms = (time.time() - _t_fetch0) * 1000
+                        # This step's exposed wait per family, in seconds, for the window's per-step series
+                        # (dfoptimizer step_series; the planner verifies a move on the targeted family's series).
+                        _step_exp = {"storage": _fetch_ms / 1000.0}
                         self._job_exposure_fetch_buf.append(float(_fetch_ms))
                         if _sf_on:
                             _sf_fetch.append((time.perf_counter() - _sw_prev) * 1000.0)
@@ -3304,6 +3307,8 @@ class Trainer:
                                 _dms = min(_hs[1] * 1000.0, _fetch_ms)
                                 _stall_acct.add_split(_fetch_ms - _dms, _frac)
                                 _stall_acct.add_delivery(_dms)
+                                _step_exp["storage"] = (_fetch_ms - _dms) / 1000.0
+                                _step_exp["delivery"] = _dms / 1000.0
 
                         if self.max_training_step != -1 and step > self.max_training_step:
                             log0(f"Training step limit reached: {self.max_training_step}")
@@ -3374,6 +3379,8 @@ class Trainer:
                                     self._bwd_only_ms, self._c0_bwd_ms)
                             if _se_on:
                                 _se_exposed.append(exposed_comm_ms)
+                            if comm_hook.comm_probe_mode() in ("event", "ab"):
+                                _step_exp["comm"] = exposed_comm_ms / 1000.0
                             if PERFTRACER_ENABLE:
                                 _emit_exposed_comm(step, exposed_comm_ms, epoch)
                             # read_and_clear_bucket_ms: floats already (blocking mode), or
@@ -3448,6 +3455,7 @@ class Trainer:
                             # Diagnostic only (APPLY_ACK log): the 0-based index of the step this
                             # window boundary closes, so an action's first affected step is after_step+1.
                             self._loop_step = step
+                            _window.note_step_exposure(**_step_exp)
                             _window_closed = _window.stop()
                             _window_every_n = _window.every_n
 
