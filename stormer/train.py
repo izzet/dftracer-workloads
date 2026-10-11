@@ -35,6 +35,8 @@
 
 from typing import Any, Optional
 from functools import partial
+import motivation_timers as _mot
+
 import hashlib
 import json
 import logging
@@ -920,6 +922,7 @@ class ERA5Dataset(Dataset):
                             os.path.basename(path), type(e).__name__, e)
             return None
 
+    @_mot.producer_timed("fused_hdf5_preprocess_unresolved")
     def get_data_given_path(self, path: str, variables: list[str]):
         # ------------------------------------------------------------------ TWO-STAGE (DECODE DOMAIN)
         # STORMER_TWOSTAGE=1 with a gzip+CHUNKED dataset splits the read into two separately
@@ -1009,7 +1012,7 @@ class ERA5Dataset(Dataset):
         out = self.get_data_given_path(out_path, self.variables)
 
         # 3. Preprocess
-        with dft_ai.data.preprocess:
+        with dft_ai.data.preprocess, _mot.producer_span("decode_preprocess"):
             diff = out - inp_data
             interval = torch.Tensor([chosen_interval]) / 10.0
             inp_transform = self.inp_transform(inp_data).unsqueeze(0)
@@ -1708,6 +1711,7 @@ class Trainer:
         return replace_constant(norm_pred_diff, variables)
 
     @dft_ai.device.transfer
+    @_mot.timed("delivery.h2d")
     def send_to_device(self, batch):
         x, gt_diff, interval_tensors = batch[:3]
         x = x.to(device=self.device)  # , non_blocking=True)
@@ -1739,6 +1743,7 @@ class Trainer:
             yield
 
     @dft_ai.compute.forward
+    @_mot.timed("compute.forward_loss")
     def forward_step(self, batch: Any):
         _fp("fwd.start")
         return self._forward_loss(batch)
@@ -1747,21 +1752,24 @@ class Trainer:
         x, gt_diff, interval = batch
 
         with self.forward_context():
-            pred_diff = self.forward_train(x, self.variables, interval)
+            with _mot.span("compute.forward"):
+                pred_diff = self.forward_train(x, self.variables, interval)
 
-            loss_dict = lat_weighted_mse(
-                pred_diff,
-                gt_diff,
-                self.variables,
-                self.lat,
-                weighted=self.weighted_loss,
-                weight_dict=WEIGHT_DICT,
-            )
+            with _mot.span("compute.loss"):
+                loss_dict = lat_weighted_mse(
+                    pred_diff,
+                    gt_diff,
+                    self.variables,
+                    self.lat,
+                    weighted=self.weighted_loss,
+                    weight_dict=WEIGHT_DICT,
+                )
 
         loss = loss_dict["w_mse_aggregate"]
         return loss, loss.detach()
 
     @dft_ai.compute.backward
+    @_mot.timed("compute.backward_optimizer_inclusive")
     def backward_step(self, loss, batch_idx: int, n_accum_steps: int):
         # This is deliberately an observed-completion bit, rather than an
         # attempted-step counter.  Retained state v1 is FP32-only, but Trainer
@@ -1776,9 +1784,11 @@ class Trainer:
             torch.cuda.synchronize()
             _tb = time.time()
         if self.scaler:
-            self.scaler.scale(loss).backward()
+            with _mot.span("compute.backward"):
+                self.scaler.scale(loss).backward()
         else:
-            loss.backward()
+            with _mot.span("compute.backward"):
+                loss.backward()
         if _time_bwd:
             torch.cuda.synchronize()
             self._bwd_only_ms = (time.time() - _tb) * 1000
@@ -1798,10 +1808,12 @@ class Trainer:
             if os.environ.get("STORMER_LOG_GRAD_NORM", "0") == "1":
                 self._last_grad_norm = repr(float(_gn))   # opt-in probe-equivalence check; float() syncs
             if self.scaler:
-                self.scaler.step(self.optimizer)
+                with _mot.span("compute.optimizer"):
+                    self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                self.optimizer.step()
+                with _mot.span("compute.optimizer"):
+                    self.optimizer.step()
 
             if self.scheduler:
                 self.scheduler.step()
@@ -1866,6 +1878,7 @@ class Trainer:
         return c0
 
     @dft_ai.compute
+    @_mot.timed("compute.parent")
     def training_step(self, batch: Any, batch_idx: int):
         if self._trajectory_retention is not None:
             self._last_observed_optimizer_update = False
@@ -2795,6 +2808,7 @@ class Trainer:
 
     @dft_ai.pipeline.train
     def train(self):
+        _mot.identify(MPIUtils.rank(), MPIUtils.size())
         self._setup_optimizer_context()
         # Job-wide, rank-symmetric gate for the plan-apply collective. The optimizer context is
         # active on only a SUBSET of ranks, but DFOPTIMIZER_ENABLE is identical on every rank, so
@@ -3263,7 +3277,8 @@ class Trainer:
                         if MPIUtils.rank() == 0:
                             import itertools
                             _fetch_iter = itertools.islice(_fetch_iter, 2)
-                    _step_iter = wrap_step_iterator(_fetch_iter, self._loop_exit_consensus)
+                    _mot.start_gpu_capture()
+                    _step_iter = _mot.observe(wrap_step_iterator(_fetch_iter, self._loop_exit_consensus), epoch)
                     for batch, _is_padding_step in _step_iter:
                         if _is_padding_step:
                             raise RuntimeError("PADDING_BATCH_FORBIDDEN: training would alter trajectory")
@@ -3659,6 +3674,7 @@ class Trainer:
         self._finish_trajectory_retention()
 
     def finalize(self):
+        _mot.flush()
         return None
 
 def get_args():
@@ -3839,7 +3855,7 @@ def main() -> None:
         faulthandler.cancel_dump_traceback_later()
         sys.stdout.flush()
         sys.stderr.flush()
-        os._exit(0)
+        _mot.flush(); os._exit(0)
     if dist_initialized:
         dist.barrier()
         dist.destroy_process_group()

@@ -18,6 +18,7 @@ Usage in the training loop:
                 loader.reconfigure(num_workers=plan["num_workers"], ...)
 """
 
+import motivation_timers as _mot
 import hashlib
 import json
 import logging
@@ -383,13 +384,14 @@ class LiveDataLoader:
             kwargs["prefetch_factor"] = max(self.prefetch_factor, 1)
             if self._persistent_workers:
                 kwargs["persistent_workers"] = True
+        dataset, collate = _mot.loader_inputs(self._dataset, self._collate_fn, self._batch_size is not None)
         return DataLoader(
-            self._dataset,
+            dataset,
             batch_size=self._batch_size,
             sampler=_EpochKeySampler(self._sampler, self) if self._keep_pool else self._sampler,
             num_workers=pool,
             pin_memory=self._pin_memory,
-            collate_fn=self._collate_fn,
+            collate_fn=collate,
             drop_last=False,
             **kwargs,
         )
@@ -576,7 +578,7 @@ class LiveDataLoader:
         # A batch primed by an eager apply_pending() is handed out first, so the eager path costs
         # the stream nothing. Kept BEFORE the pending check: apply_pending already cleared the flag.
         if self._primed is not None:
-            batch = self._primed
+            batch = _mot.unwrap(self._primed)
             self._primed = None
             self._samples_yielded += self._batch_size or 1
             return batch
@@ -592,7 +594,8 @@ class LiveDataLoader:
 
         t_next = time.perf_counter()
         try:
-            batch = next(self._inner_iter)
+            _mot.wrap_get_data(self._inner_iter)
+            batch = _mot.unwrap(next(self._inner_iter))
         except StopIteration:
             raise
         self._next_s += time.perf_counter() - t_next
